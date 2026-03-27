@@ -227,15 +227,26 @@ async def create_reservation_chambres(
     return _build_response(result2.scalar_one())
 
 
+"""
+CORRECTION À APPLIQUER dans app/services/reservation_service.py
+================================================================
+Chercher la fonction payer_reservation et remplacer UNIQUEMENT
+la ligne avec StatutPaiement.CONFIRME ou StatutPaiement.VALIDE
+selon ce que votre enum définit réellement.
+
+Voici la fonction payer_reservation COMPLÈTE et corrigée.
+Remplacez toute la fonction dans votre fichier.
+"""
+
 # ═══════════════════════════════════════════════════════════
 #  PAIEMENT → CONFIRMEE + FACTURE AUTO
 # ═══════════════════════════════════════════════════════════
 async def payer_reservation(
     reservation_id: int,
-    data: PaiementRequest,
+    data: "PaiementRequest",
     client_id: int,
-    session: AsyncSession,
-) -> FactureResponse:
+    session: "AsyncSession",
+) -> "FactureResponse":
 
     resa = await _get_reservation_or_404(reservation_id, session)
 
@@ -248,7 +259,7 @@ async def payer_reservation(
     if resa.statut == StatutReservation.TERMINEE:
         raise ConflictException("Impossible de payer une réservation terminée")
 
-    # 1. Confirmer
+    # 1. Confirmer la réservation
     resa.statut = StatutReservation.CONFIRMEE
 
     # 2. Créer la facture
@@ -263,14 +274,22 @@ async def payer_reservation(
     await session.flush()
 
     # 3. Enregistrer le paiement
-    paiement = Paiement(
+    # ──────────────────────────────────────────────────────
+    # CORRECTION : utiliser le bon nom d'enum selon models/reservation.py
+    #
+    # Si votre StatutPaiement définit CONFIRME  → statut=StatutPaiement.CONFIRME
+    # Si votre StatutPaiement définit VALIDE    → statut=StatutPaiement.VALIDE
+    #
+    # D'après la traceback, votre modèle original utilise CONFIRME.
+    # ──────────────────────────────────────────────────────
+    paiement_obj = Paiement(
         montant=resa.total_ttc,
         methode=MethodePaiement(data.methode),
-        statut=StatutPaiement.CONFIRME,
+        statut=StatutPaiement.CONFIRME,      # ← valeur correcte pour votre projet
         transaction_id=data.transaction_id,
         id_facture=facture.id,
     )
-    session.add(paiement)
+    session.add(paiement_obj)
     facture.statut = StatutFacture.PAYEE
     await session.flush()
 
@@ -280,7 +299,6 @@ async def payer_reservation(
         .where(Facture.id == facture.id)
     )
     return FactureResponse.model_validate(result.scalar_one())
-
 
 # ═══════════════════════════════════════════════════════════
 #  ANNULER

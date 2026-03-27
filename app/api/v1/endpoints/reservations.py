@@ -1,26 +1,20 @@
 """
 app/api/v1/endpoints/reservations.py
 =====================================
-Endpoints Réservations — version corrigée complète.
-
-Corrections appliquées :
-  - reserver_visiteur      : selectinload(type_chambre) sur chambre
-  - download_voucher_visiteur : selectinload(type_chambre) sur chambre
-  - download_voucher_client   : selectinload(facture → paiements) + selectinload(type_chambre)
-
 Routes :
   POST  /reservations/voyage              → Réserver voyage [CLIENT]
   POST  /reservations/chambres            → Réserver chambre hôtel [CLIENT]
   POST  /reservations/visiteur            → Réservation hôtel visiteur sans compte
   GET   /reservations/mes-reservations    → Mes réservations [CLIENT]
   GET   /reservations                     → Toutes [ADMIN]
+  GET   /reservations/admin/enrichi       → Clients + Visiteurs enrichis [ADMIN]
   GET   /reservations/{id}               → Détail [CLIENT|ADMIN]
   POST  /reservations/{id}/paiement      → Payer [CLIENT]
   POST  /reservations/{id}/annuler       → Annuler [CLIENT|ADMIN]
   GET   /reservations/visiteur/{v}/pdf   → Voucher PDF visiteur hôtel
   GET   /reservations/{id}/voucher-pdf   → Voucher PDF client (hôtel ou voyage)
 """
-from typing import Optional
+from typing import Optional, List
 import uuid as _uuid
 import io as _io
 
@@ -127,18 +121,15 @@ async def reserver_visiteur(
 
     nb_nuits = (d2 - d1).days
 
-    # ── CORRECTION : charger type_chambre avec selectinload ──────────
-    # Sans ça → MissingGreenlet sur chambre.type_chambre → 500
     ch_res = await session.execute(
         _sel(_Ch)
-        .options(_sil(_Ch.type_chambre))          # ← OBLIGATOIRE
+        .options(_sil(_Ch.type_chambre))
         .where(_Ch.id == data.id_chambre, _Ch.actif == True)
     )
     chambre = ch_res.scalar_one_or_none()
     if not chambre:
         raise HTTPException(404, "Chambre introuvable ou inactive")
 
-    # Récupérer tarif valide
     t_res = await session.execute(
         _sel(_T).where(
             _T.id_chambre == data.id_chambre,
@@ -151,11 +142,9 @@ async def reserver_visiteur(
         raise HTTPException(422, f"Aucun tarif disponible pour la période {d1} → {d2}")
 
     total_ttc = float(tarif.prix) * nb_nuits
-
-    # Générer numéro voucher unique
-    annee = d1.year
-    cnt_r = await session.execute(_sel(_func.count(_RV.id)))
-    cnt   = cnt_r.scalar_one() + 1
+    annee     = d1.year
+    cnt_r     = await session.execute(_sel(_func.count(_RV.id)))
+    cnt       = cnt_r.scalar_one() + 1
     numero_voucher = f"VIS-{annee}-{cnt:05d}-{_uuid.uuid4().hex[:4].upper()}"
 
     resa = _RV(
@@ -174,12 +163,9 @@ async def reserver_visiteur(
     await session.commit()
     await session.refresh(resa)
 
-    # Récupérer hôtel
     from app.models.hotel import Hotel as _H
     h_res = await session.execute(_sel(_H).where(_H.id == chambre.id_hotel))
     hotel = h_res.scalar_one_or_none()
-
-    # type_chambre déjà chargé → pas de lazy load
     chambre_nom = chambre.type_chambre.nom if chambre.type_chambre else "Chambre"
 
     return VisiteurReservationResponse(
@@ -214,10 +200,10 @@ async def mes_reservations(
 
 
 # ══════════════════════════════════════════════════════════
-#  ADMIN — TOUTES
+#  ADMIN — TOUTES (basique)
 # ══════════════════════════════════════════════════════════
 @router.get("", response_model=ReservationListResponse,
-            summary="Toutes les réservations [ADMIN]")
+            summary="Toutes les réservations clients [ADMIN]")
 async def list_all_reservations(
     statut: Optional[str] = Query(None),
     client_id: Optional[int] = Query(None),
@@ -228,6 +214,232 @@ async def list_all_reservations(
 ) -> ReservationListResponse:
     return await reservation_service.list_all_reservations(
         session, statut=statut, client_id=client_id, page=page, per_page=per_page
+    )
+
+
+# ══════════════════════════════════════════════════════════
+#  ADMIN — ENRICHI : clients + visiteurs fusionnés
+#  ⚠️  DOIT être AVANT /{reservation_id}
+# ══════════════════════════════════════════════════════════
+
+class ReservationAdminItem(_BM):
+    """Représente une réservation unifiée — client ou visiteur."""
+    id:                  int
+    source:              str             # "client" | "visiteur"
+    date_reservation:    str
+    date_debut:          str
+    date_fin:            str
+    nb_nuits:            int
+    statut:              str
+    total_ttc:           float
+    # Personne
+    client_nom:          str
+    client_prenom:       str
+    client_email:        str
+    client_telephone:    Optional[str]   = None
+    # Hôtel ou Voyage
+    type_resa:           str             # "hotel" | "voyage"
+    hotel_nom:           Optional[str]   = None
+    hotel_ville:         Optional[str]   = None
+    voyage_titre:        Optional[str]   = None
+    voyage_destination:  Optional[str]   = None
+    # Facture / Voucher
+    numero_facture:      Optional[str]   = None
+    statut_facture:      Optional[str]   = None
+    numero_voucher:      Optional[str]   = None
+    methode_paiement:    Optional[str]   = None
+
+
+class ReservationAdminListResponse(_BM):
+    total:    int
+    page:     int
+    per_page: int
+    nb_clients:   int
+    nb_visiteurs: int
+    items:    List[ReservationAdminItem]
+
+
+async def _get_hotel_info(id_chambre: int, session) -> tuple:
+    """Retourne (hotel_nom, hotel_ville) depuis un id_chambre."""
+    from app.models.hotel import Hotel as _H
+    ch_r = await session.execute(_sel(_Ch).where(_Ch.id == id_chambre))
+    ch   = ch_r.scalar_one_or_none()
+    if not ch:
+        return (None, None)
+    h_r = await session.execute(_sel(_H).where(_H.id == ch.id_hotel))
+    h   = h_r.scalar_one_or_none()
+    return (h.nom if h else None, h.ville if h else None)
+
+
+@router.get(
+    "/admin/enrichi",
+    response_model=ReservationAdminListResponse,
+    summary="Toutes les réservations enrichies — clients ET visiteurs [ADMIN]",
+)
+async def list_reservations_enrichi(
+    statut:    Optional[str] = Query(None, description="EN_ATTENTE | CONFIRMEE | ANNULEE | TERMINEE"),
+    type_resa: Optional[str] = Query(None, description="hotel | voyage"),
+    source:    Optional[str] = Query(None, description="client | visiteur"),
+    search:    Optional[str] = Query(None, description="Nom, email, hôtel, voyage, n° facture/voucher"),
+    page:      int           = Query(1, ge=1),
+    per_page:  int           = Query(20, ge=1, le=100),
+    session: AsyncSession    = Depends(get_db),
+    _: TokenData             = Depends(require_admin),
+):
+    from app.models.utilisateur import Utilisateur as _Usr
+    from app.models.hotel import Hotel as _H, Chambre as _Ch2
+    from app.models.reservation import StatutReservation as _SR2
+
+    items: List[ReservationAdminItem] = []
+
+    # ══════════════════════════════════════════════════
+    #  1. RÉSERVATIONS CLIENTS (table reservation)
+    # ══════════════════════════════════════════════════
+    if source in (None, "client"):
+        query = (
+            _sel(Reservation)
+            .options(
+                _sil(Reservation.lignes_chambres),
+                _sil(Reservation.facture),
+            )
+            .order_by(Reservation.date_reservation.desc())
+        )
+
+        if statut:
+            try:
+                query = query.where(Reservation.statut == _SR2(statut))
+            except ValueError:
+                pass
+
+        if type_resa == "hotel":
+            query = query.where(Reservation.id_voyage == None)
+        elif type_resa == "voyage":
+            query = query.where(Reservation.id_voyage != None)
+
+        result = await session.execute(query)
+        resas  = result.scalars().all()
+
+        for resa in resas:
+            # Client
+            usr_r = await session.execute(_sel(_Usr).where(_Usr.id == resa.id_client))
+            usr   = usr_r.scalar_one_or_none()
+
+            hotel_nom = hotel_ville = voyage_titre = voyage_dest = None
+
+            if resa.id_voyage:
+                v_r = await session.execute(_sel(_Voyage).where(_Voyage.id == resa.id_voyage))
+                v   = v_r.scalar_one_or_none()
+                voyage_titre = v.titre       if v else f"Voyage #{resa.id_voyage}"
+                voyage_dest  = v.destination if v else "—"
+                type_r = "voyage"
+            else:
+                if resa.lignes_chambres:
+                    hotel_nom, hotel_ville = await _get_hotel_info(
+                        resa.lignes_chambres[0].id_chambre, session
+                    )
+                type_r = "hotel"
+
+            items.append(ReservationAdminItem(
+                id                 = resa.id,
+                source             = "client",
+                date_reservation   = resa.date_reservation.strftime("%d/%m/%Y %H:%M"),
+                date_debut         = str(resa.date_debut),
+                date_fin           = str(resa.date_fin),
+                nb_nuits           = (resa.date_fin - resa.date_debut).days,
+                statut             = resa.statut.value,
+                total_ttc          = float(resa.total_ttc),
+                client_nom         = usr.nom       if usr else "—",
+                client_prenom      = usr.prenom    if usr else "—",
+                client_email       = usr.email     if usr else "—",
+                client_telephone   = getattr(usr, "telephone", None),
+                type_resa          = type_r,
+                hotel_nom          = hotel_nom,
+                hotel_ville        = hotel_ville,
+                voyage_titre       = voyage_titre,
+                voyage_destination = voyage_dest,
+                numero_facture     = resa.facture.numero       if resa.facture else None,
+                statut_facture     = resa.facture.statut.value if resa.facture else None,
+                numero_voucher     = None,
+                methode_paiement   = None,
+            ))
+
+    nb_clients = len(items)
+
+    # ══════════════════════════════════════════════════
+    #  2. RÉSERVATIONS VISITEURS (table reservation_visiteur)
+    #     → toujours type "hotel", statut string direct
+    # ══════════════════════════════════════════════════
+    if source in (None, "visiteur") and type_resa in (None, "hotel"):
+        vis_query = _sel(_RV).order_by(_RV.created_at.desc())
+
+        # Filtre statut (colonne String dans reservation_visiteur)
+        if statut:
+            vis_query = vis_query.where(_RV.statut == statut)
+
+        vis_result = await session.execute(vis_query)
+        visiteurs  = vis_result.scalars().all()
+
+        for vis in visiteurs:
+            hotel_nom, hotel_ville = await _get_hotel_info(vis.id_chambre, session)
+
+            items.append(ReservationAdminItem(
+                id                 = vis.id,
+                source             = "visiteur",
+                date_reservation   = vis.created_at.strftime("%d/%m/%Y %H:%M"),
+                date_debut         = str(vis.date_debut),
+                date_fin           = str(vis.date_fin),
+                nb_nuits           = (vis.date_fin - vis.date_debut).days,
+                statut             = vis.statut,
+                total_ttc          = float(vis.total_ttc),
+                client_nom         = vis.nom,
+                client_prenom      = vis.prenom,
+                client_email       = vis.email,
+                client_telephone   = vis.telephone,
+                type_resa          = "hotel",
+                hotel_nom          = hotel_nom,
+                hotel_ville        = hotel_ville,
+                voyage_titre       = None,
+                voyage_destination = None,
+                numero_facture     = None,
+                statut_facture     = None,
+                numero_voucher     = vis.numero_voucher,
+                methode_paiement   = vis.methode_paiement,
+            ))
+
+    nb_visiteurs = len(items) - nb_clients
+
+    # ══════════════════════════════════════════════════
+    #  3. FILTRE SEARCH (nom, email, hôtel, voyage, facture, voucher)
+    # ══════════════════════════════════════════════════
+    if search:
+        s = search.lower().strip()
+        items = [
+            it for it in items
+            if s in (it.client_nom        or "").lower()
+            or s in (it.client_prenom     or "").lower()
+            or s in (it.client_email      or "").lower()
+            or s in (it.hotel_nom         or "").lower()
+            or s in (it.voyage_titre      or "").lower()
+            or s in (it.numero_facture    or "").lower()
+            or s in (it.numero_voucher    or "").lower()
+        ]
+        nb_clients   = sum(1 for it in items if it.source == "client")
+        nb_visiteurs = sum(1 for it in items if it.source == "visiteur")
+
+    # ── Trier par date décroissante ──────────────────
+    items.sort(key=lambda x: x.date_reservation, reverse=True)
+
+    total      = len(items)
+    offset     = (page - 1) * per_page
+    items_page = items[offset: offset + per_page]
+
+    return ReservationAdminListResponse(
+        total=total,
+        page=page,
+        per_page=per_page,
+        nb_clients=nb_clients,
+        nb_visiteurs=nb_visiteurs,
+        items=items_page,
     )
 
 
@@ -282,11 +494,6 @@ async def annuler_reservation(
 #  GÉNÉRATION PDF VOUCHER (fonction partagée)
 # ══════════════════════════════════════════════════════════
 def _generate_voucher_pdf(**kw) -> bytes:
-    """
-    Génère un PDF voucher avec reportlab.
-    Fonctionne pour hôtel (type_resa='hotel') et voyage (type_resa='voyage').
-    Fallback texte brut si reportlab absent.
-    """
     try:
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4
@@ -305,7 +512,6 @@ def _generate_voucher_pdf(**kw) -> bytes:
         gray = colors.HexColor("#8A9BB0")
         story = []
 
-        # En-tête
         h_style = ParagraphStyle("h", fontSize=22, textColor=colors.white,
                                    fontName="Helvetica-Bold", alignment=1)
         s_style = ParagraphStyle("s", fontSize=11,
@@ -324,7 +530,7 @@ def _generate_voucher_pdf(**kw) -> bytes:
         story.append(hdr)
         story.append(Spacer(1, 16))
 
-        is_voyage = kw.get("type_resa") == "voyage"
+        is_voyage  = kw.get("type_resa") == "voyage"
         type_label = "✈  VOYAGE" if is_voyage else "HOTEL"
 
         story.append(Paragraph(
@@ -412,7 +618,6 @@ def _generate_voucher_pdf(**kw) -> bytes:
         return buf.getvalue()
 
     except ImportError:
-        # Fallback texte si reportlab non installé
         lines = [
             f"EasyVoyage - Voucher N: {kw.get('numero','?')}",
             f"Client: {kw.get('nom','?')}",
@@ -446,7 +651,6 @@ async def download_voucher_visiteur(
     voucher_num: str,
     session: AsyncSession = Depends(get_db),
 ):
-    # Charger la réservation visiteur
     res  = await session.execute(_sel(_RV).where(_RV.numero_voucher == voucher_num))
     resa = res.scalar_one_or_none()
     if not resa:
@@ -454,11 +658,9 @@ async def download_voucher_visiteur(
 
     from app.models.hotel import Hotel as _H
 
-    # ── CORRECTION : charger chambre AVEC type_chambre ───────────────
-    # Sans _sil(_Ch.type_chambre) → MissingGreenlet → 500 → "Failed to fetch"
     ch_res  = await session.execute(
         _sel(_Ch)
-        .options(_sil(_Ch.type_chambre))          # ← OBLIGATOIRE
+        .options(_sil(_Ch.type_chambre))
         .where(_Ch.id == resa.id_chambre)
     )
     chambre = ch_res.scalar_one_or_none()
@@ -468,7 +670,6 @@ async def download_voucher_visiteur(
         h_res = await session.execute(_sel(_H).where(_H.id == chambre.id_hotel))
         hotel = h_res.scalar_one_or_none()
 
-    # type_chambre maintenant chargé → accès direct sans lazy load
     chambre_nom = "Chambre"
     if chambre and chambre.type_chambre:
         chambre_nom = chambre.type_chambre.nom
@@ -509,8 +710,6 @@ async def download_voucher_client(
     from app.models.hotel import Hotel as _H, Chambre as _Ch2
     from app.models.utilisateur import Utilisateur as _Usr
 
-    # ── CORRECTION : charger facture → paiements en une seule requête
-    # Sans selectinload(Facture.paiements) → MissingGreenlet sur paiements[0]
     resa_res = await session.execute(
         _sel(Reservation)
         .options(
@@ -525,7 +724,6 @@ async def download_voucher_client(
     if token.role == "CLIENT" and resa.id_client != token.user_id:
         raise HTTPException(403, "Accès refusé")
 
-    # Infos client
     usr_res = await session.execute(_sel(_Usr).where(_Usr.id == resa.id_client))
     usr = usr_res.scalar_one_or_none()
     nom_client  = f"{usr.prenom} {usr.nom}" if usr else "Client"
@@ -538,7 +736,6 @@ async def download_voucher_client(
     )
     montant = float(resa.total_ttc)
 
-    # ── CAS VOYAGE ────────────────────────────────────────────────────
     if resa.id_voyage:
         v_res  = await session.execute(_sel(_Voyage).where(_Voyage.id == resa.id_voyage))
         voyage = v_res.scalar_one_or_none()
@@ -561,8 +758,6 @@ async def download_voucher_client(
             montant      = montant,
             methode      = methode_str,
         )
-
-    # ── CAS HÔTEL ─────────────────────────────────────────────────────
     else:
         hotel_nom, hotel_ville, chambre_nom = "—", "—", "Chambre"
         nb_adultes, nb_enfants = 1, 0
@@ -572,16 +767,16 @@ async def download_voucher_client(
             nb_adultes = lc.nb_adultes
             nb_enfants = lc.nb_enfants
 
-            # ── CORRECTION : charger type_chambre avec selectinload ──
             ch_res = await session.execute(
-                _sel(_Ch2)
-                .options(_sil(_Ch2.type_chambre))  # ← OBLIGATOIRE
-                .where(_Ch2.id == lc.id_chambre)
+                _sel(_Ch)
+                .options(_sil(_Ch.type_chambre))
+                .where(_Ch.id == lc.id_chambre)
             )
             ch = ch_res.scalar_one_or_none()
             if ch:
                 chambre_nom = ch.type_chambre.nom if ch.type_chambre else "Chambre"
-                h_res = await session.execute(_sel(_H).where(_H.id == ch.id_hotel))
+                from app.models.hotel import Hotel as _H2
+                h_res = await session.execute(_sel(_H2).where(_H2.id == ch.id_hotel))
                 h = h_res.scalar_one_or_none()
                 if h:
                     hotel_nom, hotel_ville = h.nom, h.ville
