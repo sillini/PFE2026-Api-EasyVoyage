@@ -2,23 +2,24 @@
 Endpoints Support Chat — partenaire ↔ admin.
 
 Partenaire :
-  POST   /partenaire/support/conversations          → créer demande
-  GET    /partenaire/support/conversations          → mes conversations
-  GET    /partenaire/support/conversations/{id}     → détail + messages
-  POST   /partenaire/support/conversations/{id}/messages → envoyer message
-  PATCH  /partenaire/support/conversations/{id}/close    → fermer
+  POST   /partenaire/support/conversations                    → créer demande
+  GET    /partenaire/support/conversations                    → mes conversations
+  GET    /partenaire/support/conversations/{id}               → détail + messages
+  POST   /partenaire/support/conversations/{id}/messages      → envoyer message
+  PATCH  /partenaire/support/conversations/{id}/close         → fermer
 
 Admin :
-  GET    /admin/support/conversations               → toutes (filtre statut)
-  GET    /admin/support/conversations/{id}          → détail + messages
-  PATCH  /admin/support/conversations/{id}/accept   → accepter
-  PATCH  /admin/support/conversations/{id}/close    → fermer
-  POST   /admin/support/conversations/{id}/messages → envoyer message
+  POST   /admin/support/conversations                         → créer conversation (admin → partenaire)
+  GET    /admin/support/conversations                         → toutes (filtre statut)
+  GET    /admin/support/conversations/{id}                    → détail + messages
+  PATCH  /admin/support/conversations/{id}/accept             → accepter
+  PATCH  /admin/support/conversations/{id}/close              → fermer
+  POST   /admin/support/conversations/{id}/messages           → envoyer message
 
 Commun :
-  GET    /support/notifications                     → mes notifications
-  PATCH  /support/notifications/{id}/read           → marquer lue
-  PATCH  /support/notifications/read-all            → tout marquer lu
+  GET    /support/notifications                               → mes notifications
+  PATCH  /support/notifications/{id}/read                    → marquer lue
+  PATCH  /support/notifications/read-all                     → tout marquer lu
 """
 from fastapi import APIRouter, Depends, Query
 from typing import Optional
@@ -31,6 +32,7 @@ from app.schemas.support import (
     ConversationCreate, ConversationListResponse, ConversationResponse,
     MessageCreate, MessageResponse,
     NotificationListResponse,
+    AdminConversationCreate,        # ← nouveau schéma
 )
 import app.services.support_service as svc
 
@@ -112,6 +114,25 @@ async def partenaire_close_conv(
 #  ADMIN
 # ══════════════════════════════════════════════════════════
 
+@router.post(
+    "/admin/support/conversations",
+    response_model=ConversationResponse,
+    status_code=201,
+    summary="Créer une conversation vers un partenaire [ADMIN]",
+    description=(
+        "L'admin initie directement une conversation avec un partenaire. "
+        "La conversation est créée en statut **ACCEPTEE** (pas de validation requise). "
+        "Le partenaire reçoit une notification et peut répondre immédiatement."
+    ),
+)
+async def admin_create_conv(
+    data: AdminConversationCreate,
+    session: AsyncSession = Depends(get_db),
+    current: TokenData = Depends(require_admin),
+):
+    return await svc.admin_create_conversation(current.user_id, data, session)
+
+
 @router.get(
     "/admin/support/conversations",
     response_model=ConversationListResponse,
@@ -180,15 +201,15 @@ async def admin_send_msg(
 
 
 # ══════════════════════════════════════════════════════════
-#  NOTIFICATIONS — commun
+#  NOTIFICATIONS (commun)
 # ══════════════════════════════════════════════════════════
 
 @router.get(
     "/support/notifications",
     response_model=NotificationListResponse,
-    summary="Mes notifications [ADMIN ou PARTENAIRE]",
+    summary="Mes notifications [PARTENAIRE | ADMIN]",
 )
-async def get_notifs(
+async def get_notifications(
     session: AsyncSession = Depends(get_db),
     current: TokenData = Depends(get_current_user),
 ):
@@ -196,25 +217,23 @@ async def get_notifs(
 
 
 @router.patch(
-    "/support/notifications/read-all",
-    summary="Tout marquer lu",
-)
-async def read_all_notifs(
-    session: AsyncSession = Depends(get_db),
-    current: TokenData = Depends(get_current_user),
-):
-    await svc.mark_all_read(current.user_id, session)
-    return {"message": "Toutes les notifications marquées comme lues"}
-
-
-@router.patch(
     "/support/notifications/{notif_id}/read",
-    summary="Marquer une notification lue",
+    summary="Marquer une notification comme lue",
 )
-async def read_notif(
+async def mark_notif_read(
     notif_id: int,
     session: AsyncSession = Depends(get_db),
     current: TokenData = Depends(get_current_user),
 ):
-    await svc.mark_notification_read(notif_id, current.user_id, session)
-    return {"message": "Notification marquée comme lue"}
+    return await svc.mark_notification_read(notif_id, current.user_id, session)
+
+
+@router.patch(
+    "/support/notifications/read-all",
+    summary="Marquer toutes les notifications comme lues",
+)
+async def mark_all_read(
+    session: AsyncSession = Depends(get_db),
+    current: TokenData = Depends(get_current_user),
+):
+    return await svc.mark_all_notifications_read(current.user_id, session)

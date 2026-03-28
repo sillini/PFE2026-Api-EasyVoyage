@@ -2,19 +2,23 @@
 app/api/v1/endpoints/reservations.py
 =====================================
 Routes :
-  POST  /reservations/voyage              → Réserver voyage [CLIENT]
-  POST  /reservations/chambres            → Réserver chambre hôtel [CLIENT]
-  POST  /reservations/visiteur            → Réservation hôtel visiteur sans compte
-  GET   /reservations/mes-reservations    → Mes réservations [CLIENT]
-  GET   /reservations                     → Toutes [ADMIN]
-  GET   /reservations/admin/enrichi       → Clients + Visiteurs enrichis [ADMIN]
-  GET   /reservations/{id}               → Détail [CLIENT|ADMIN]
-  POST  /reservations/{id}/paiement      → Payer [CLIENT]
-  POST  /reservations/{id}/annuler       → Annuler [CLIENT|ADMIN]
-  GET   /reservations/visiteur/{v}/pdf   → Voucher PDF visiteur hôtel
-  GET   /reservations/{id}/voucher-pdf   → Voucher PDF client (hôtel ou voyage)
+  POST  /reservations/voyage                        → Réserver voyage [CLIENT]
+  POST  /reservations/chambres                      → Réserver chambre hôtel [CLIENT]
+  POST  /reservations/visiteur                      → Réservation hôtel visiteur sans compte
+                                                      + envoi automatique du voucher par email
+  GET   /reservations/mes-reservations              → Mes réservations [CLIENT]
+  GET   /reservations                               → Toutes [ADMIN]
+  GET   /reservations/admin/enrichi                 → Clients + Visiteurs enrichis [ADMIN]
+  GET   /reservations/partenaire/mes-hotels         → Hôtels du partenaire + stats [PARTENAIRE]
+  GET   /reservations/partenaire/hotel/{hotel_id}   → Réservations d'un hôtel [PARTENAIRE]
+  GET   /reservations/{id}                          → Détail [CLIENT|ADMIN]
+  POST  /reservations/{id}/paiement                 → Payer [CLIENT]
+  POST  /reservations/{id}/annuler                  → Annuler [CLIENT|ADMIN]
+  GET   /reservations/visiteur/{v}/pdf              → Voucher PDF visiteur hôtel
+  GET   /reservations/{id}/voucher-pdf              → Voucher PDF client (hôtel ou voyage)
 """
 from typing import Optional, List
+import asyncio as _asyncio
 import uuid as _uuid
 import io as _io
 
@@ -25,7 +29,12 @@ from sqlalchemy import select as _sel, func as _func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload as _sil
 
-from app.api.v1.dependencies import get_current_user, require_admin, require_client
+from app.api.v1.dependencies import (
+    get_current_user,
+    require_admin,
+    require_client,
+    require_partenaire,
+)
 from app.db.session import get_db
 from app.schemas.auth import TokenData
 from app.schemas.reservation import (
@@ -39,6 +48,7 @@ from app.models.reservation import (
 )
 from app.models.hotel import Chambre as _Ch, Tarif as _T
 from app.models.voyage import Voyage as _Voyage
+from app.services.email_service import send_voucher_email as _send_voucher_email
 import app.services.reservation_service as reservation_service
 
 router = APIRouter(prefix="/reservations", tags=["Réservations"])
@@ -105,22 +115,32 @@ class VisiteurReservationResponse(_BM):
     nb_nuits:       int
 
 
-@router.post("/visiteur", response_model=VisiteurReservationResponse,
-             status_code=status.HTTP_201_CREATED,
-             summary="Réservation hôtel visiteur sans compte")
+@router.post(
+    "/visiteur",
+    response_model=VisiteurReservationResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Réservation hôtel visiteur sans compte (+ envoi voucher PDF par email)",
+)
 async def reserver_visiteur(
     data: VisiteurReservationRequest,
     session: AsyncSession = Depends(get_db),
 ):
     from datetime import date as _date
+    from app.models.hotel import Hotel as _H
 
-    d1 = _date.fromisoformat(data.date_debut)
-    d2 = _date.fromisoformat(data.date_fin)
+    # ── 1. Valider les dates ───────────────────────────────
+    try:
+        d1 = _date.fromisoformat(data.date_debut)
+        d2 = _date.fromisoformat(data.date_fin)
+    except ValueError:
+        raise HTTPException(400, "Format de date invalide (attendu : YYYY-MM-DD)")
+
     if d2 <= d1:
         raise HTTPException(422, "date_fin doit être après date_debut")
 
     nb_nuits = (d2 - d1).days
 
+    # ── 2. Charger la chambre (active) ─────────────────────
     ch_res = await session.execute(
         _sel(_Ch)
         .options(_sil(_Ch.type_chambre))
@@ -130,6 +150,7 @@ async def reserver_visiteur(
     if not chambre:
         raise HTTPException(404, "Chambre introuvable ou inactive")
 
+    # ── 3. Trouver le tarif applicable ─────────────────────
     t_res = await session.execute(
         _sel(_T).where(
             _T.id_chambre == data.id_chambre,
@@ -141,44 +162,99 @@ async def reserver_visiteur(
     if not tarif:
         raise HTTPException(422, f"Aucun tarif disponible pour la période {d1} → {d2}")
 
-    total_ttc = float(tarif.prix) * nb_nuits
-    annee     = d1.year
-    cnt_r     = await session.execute(_sel(_func.count(_RV.id)))
-    cnt       = cnt_r.scalar_one() + 1
+    total_ttc = round(float(tarif.prix) * nb_nuits, 2)
+
+    # ── 4. Générer un numéro de voucher unique ─────────────
+    annee  = d1.year
+    cnt_r  = await session.execute(_sel(_func.count(_RV.id)))
+    cnt    = cnt_r.scalar_one() + 1
     numero_voucher = f"VIS-{annee}-{cnt:05d}-{_uuid.uuid4().hex[:4].upper()}"
 
+    # ── 5. Créer la réservation en base ────────────────────
     resa = _RV(
-        nom=data.nom, prenom=data.prenom,
-        email=data.email, telephone=data.telephone,
-        id_chambre=data.id_chambre,
-        date_debut=d1, date_fin=d2,
-        nb_adultes=data.nb_adultes, nb_enfants=data.nb_enfants,
-        total_ttc=total_ttc,
-        methode_paiement=data.methode,
-        transaction_id="T-" + _uuid.uuid4().hex[:8].upper(),
-        statut="CONFIRMEE",
-        numero_voucher=numero_voucher,
+        nom              = data.nom,
+        prenom           = data.prenom,
+        email            = data.email,
+        telephone        = data.telephone,
+        id_chambre       = data.id_chambre,
+        date_debut       = d1,
+        date_fin         = d2,
+        nb_adultes       = data.nb_adultes,
+        nb_enfants       = data.nb_enfants,
+        total_ttc        = total_ttc,
+        methode_paiement = data.methode,
+        transaction_id   = "T-" + _uuid.uuid4().hex[:8].upper(),
+        statut           = "CONFIRMEE",
+        numero_voucher   = numero_voucher,
     )
     session.add(resa)
     await session.commit()
     await session.refresh(resa)
 
-    from app.models.hotel import Hotel as _H
+    # ── 6. Charger les infos hôtel pour la réponse + email ─
     h_res = await session.execute(_sel(_H).where(_H.id == chambre.id_hotel))
     hotel = h_res.scalar_one_or_none()
-    chambre_nom = chambre.type_chambre.nom if chambre.type_chambre else "Chambre"
 
+    chambre_nom = chambre.type_chambre.nom if chambre.type_chambre else "Chambre"
+    hotel_nom   = hotel.nom   if hotel else "Hôtel"
+    hotel_ville = hotel.ville if hotel else "—"
+
+    # ── 7. Générer le PDF voucher ───────────────────────────
+    pdf_bytes = _generate_voucher_pdf(
+        type_resa   = "hotel",
+        numero      = numero_voucher,
+        nom         = f"{data.prenom} {data.nom}",
+        email       = data.email,
+        telephone   = data.telephone,
+        hotel_nom   = hotel_nom,
+        hotel_ville = hotel_ville,
+        chambre_nom = chambre_nom,
+        date_debut  = data.date_debut,
+        date_fin    = data.date_fin,
+        nb_nuits    = nb_nuits,
+        nb_adultes  = data.nb_adultes,
+        nb_enfants  = data.nb_enfants,
+        montant     = total_ttc,
+        methode     = data.methode,
+    )
+
+    # ── 8. Envoyer le voucher PDF par email (non-bloquant) ──
+    _asyncio.create_task(
+        _send_voucher_email(
+            to             = data.email,
+            prenom         = data.prenom,
+            nom            = data.nom,
+            numero_voucher = numero_voucher,
+            hotel_nom      = hotel_nom,
+            hotel_ville    = hotel_ville,
+            chambre_nom    = chambre_nom,
+            date_debut     = data.date_debut,
+            date_fin       = data.date_fin,
+            nb_nuits       = nb_nuits,
+            nb_adultes     = data.nb_adultes,
+            nb_enfants     = data.nb_enfants,
+            montant        = total_ttc,
+            methode        = data.methode,
+            pdf_bytes      = pdf_bytes,
+        )
+    )
+
+    # ── 9. Retourner la réponse immédiatement ───────────────
     return VisiteurReservationResponse(
-        id=resa.id,
-        numero_voucher=resa.numero_voucher,
-        montant_total=float(resa.total_ttc),
-        statut=resa.statut,
-        email=resa.email, nom=resa.nom, prenom=resa.prenom,
-        date_debut=str(resa.date_debut), date_fin=str(resa.date_fin),
-        hotel_nom=hotel.nom if hotel else "Hôtel",
-        chambre_nom=chambre_nom,
-        nb_adultes=resa.nb_adultes, nb_enfants=resa.nb_enfants,
-        nb_nuits=nb_nuits,
+        id             = resa.id,
+        numero_voucher = numero_voucher,
+        montant_total  = total_ttc,
+        statut         = resa.statut,
+        email          = data.email,
+        nom            = data.nom,
+        prenom         = data.prenom,
+        date_debut     = data.date_debut,
+        date_fin       = data.date_fin,
+        hotel_nom      = hotel_nom,
+        chambre_nom    = chambre_nom,
+        nb_adultes     = data.nb_adultes,
+        nb_enfants     = data.nb_enfants,
+        nb_nuits       = nb_nuits,
     )
 
 
@@ -225,38 +301,35 @@ async def list_all_reservations(
 class ReservationAdminItem(_BM):
     """Représente une réservation unifiée — client ou visiteur."""
     id:                  int
-    source:              str             # "client" | "visiteur"
+    source:              str
     date_reservation:    str
     date_debut:          str
     date_fin:            str
     nb_nuits:            int
     statut:              str
     total_ttc:           float
-    # Personne
     client_nom:          str
     client_prenom:       str
     client_email:        str
-    client_telephone:    Optional[str]   = None
-    # Hôtel ou Voyage
-    type_resa:           str             # "hotel" | "voyage"
-    hotel_nom:           Optional[str]   = None
-    hotel_ville:         Optional[str]   = None
-    voyage_titre:        Optional[str]   = None
-    voyage_destination:  Optional[str]   = None
-    # Facture / Voucher
-    numero_facture:      Optional[str]   = None
-    statut_facture:      Optional[str]   = None
-    numero_voucher:      Optional[str]   = None
-    methode_paiement:    Optional[str]   = None
+    client_telephone:    Optional[str]  = None
+    type_resa:           str
+    hotel_nom:           Optional[str]  = None
+    hotel_ville:         Optional[str]  = None
+    voyage_titre:        Optional[str]  = None
+    voyage_destination:  Optional[str]  = None
+    numero_facture:      Optional[str]  = None
+    statut_facture:      Optional[str]  = None
+    numero_voucher:      Optional[str]  = None
+    methode_paiement:    Optional[str]  = None
 
 
 class ReservationAdminListResponse(_BM):
-    total:    int
-    page:     int
-    per_page: int
+    total:        int
+    page:         int
+    per_page:     int
     nb_clients:   int
     nb_visiteurs: int
-    items:    List[ReservationAdminItem]
+    items:        List[ReservationAdminItem]
 
 
 async def _get_hotel_info(id_chambre: int, session) -> tuple:
@@ -277,24 +350,21 @@ async def _get_hotel_info(id_chambre: int, session) -> tuple:
     summary="Toutes les réservations enrichies — clients ET visiteurs [ADMIN]",
 )
 async def list_reservations_enrichi(
-    statut:    Optional[str] = Query(None, description="EN_ATTENTE | CONFIRMEE | ANNULEE | TERMINEE"),
-    type_resa: Optional[str] = Query(None, description="hotel | voyage"),
-    source:    Optional[str] = Query(None, description="client | visiteur"),
-    search:    Optional[str] = Query(None, description="Nom, email, hôtel, voyage, n° facture/voucher"),
+    statut:    Optional[str] = Query(None),
+    type_resa: Optional[str] = Query(None),
+    source:    Optional[str] = Query(None),
+    search:    Optional[str] = Query(None),
     page:      int           = Query(1, ge=1),
     per_page:  int           = Query(20, ge=1, le=100),
     session: AsyncSession    = Depends(get_db),
     _: TokenData             = Depends(require_admin),
 ):
     from app.models.utilisateur import Utilisateur as _Usr
-    from app.models.hotel import Hotel as _H, Chambre as _Ch2
     from app.models.reservation import StatutReservation as _SR2
 
     items: List[ReservationAdminItem] = []
 
-    # ══════════════════════════════════════════════════
-    #  1. RÉSERVATIONS CLIENTS (table reservation)
-    # ══════════════════════════════════════════════════
+    # ── 1. Réservations clients ────────────────────────────
     if source in (None, "client"):
         query = (
             _sel(Reservation)
@@ -304,13 +374,11 @@ async def list_reservations_enrichi(
             )
             .order_by(Reservation.date_reservation.desc())
         )
-
         if statut:
             try:
                 query = query.where(Reservation.statut == _SR2(statut))
             except ValueError:
                 pass
-
         if type_resa == "hotel":
             query = query.where(Reservation.id_voyage == None)
         elif type_resa == "voyage":
@@ -320,10 +388,8 @@ async def list_reservations_enrichi(
         resas  = result.scalars().all()
 
         for resa in resas:
-            # Client
             usr_r = await session.execute(_sel(_Usr).where(_Usr.id == resa.id_client))
             usr   = usr_r.scalar_one_or_none()
-
             hotel_nom = hotel_ville = voyage_titre = voyage_dest = None
 
             if resa.id_voyage:
@@ -365,14 +431,9 @@ async def list_reservations_enrichi(
 
     nb_clients = len(items)
 
-    # ══════════════════════════════════════════════════
-    #  2. RÉSERVATIONS VISITEURS (table reservation_visiteur)
-    #     → toujours type "hotel", statut string direct
-    # ══════════════════════════════════════════════════
+    # ── 2. Réservations visiteurs ──────────────────────────
     if source in (None, "visiteur") and type_resa in (None, "hotel"):
         vis_query = _sel(_RV).order_by(_RV.created_at.desc())
-
-        # Filtre statut (colonne String dans reservation_visiteur)
         if statut:
             vis_query = vis_query.where(_RV.statut == statut)
 
@@ -381,7 +442,6 @@ async def list_reservations_enrichi(
 
         for vis in visiteurs:
             hotel_nom, hotel_ville = await _get_hotel_info(vis.id_chambre, session)
-
             items.append(ReservationAdminItem(
                 id                 = vis.id,
                 source             = "visiteur",
@@ -408,9 +468,7 @@ async def list_reservations_enrichi(
 
     nb_visiteurs = len(items) - nb_clients
 
-    # ══════════════════════════════════════════════════
-    #  3. FILTRE SEARCH (nom, email, hôtel, voyage, facture, voucher)
-    # ══════════════════════════════════════════════════
+    # ── 3. Filtre search ───────────────────────────────────
     if search:
         s = search.lower().strip()
         items = [
@@ -426,7 +484,6 @@ async def list_reservations_enrichi(
         nb_clients   = sum(1 for it in items if it.source == "client")
         nb_visiteurs = sum(1 for it in items if it.source == "visiteur")
 
-    # ── Trier par date décroissante ──────────────────
     items.sort(key=lambda x: x.date_reservation, reverse=True)
 
     total      = len(items)
@@ -434,17 +491,389 @@ async def list_reservations_enrichi(
     items_page = items[offset: offset + per_page]
 
     return ReservationAdminListResponse(
-        total=total,
-        page=page,
-        per_page=per_page,
-        nb_clients=nb_clients,
-        nb_visiteurs=nb_visiteurs,
+        total=total, page=page, per_page=per_page,
+        nb_clients=nb_clients, nb_visiteurs=nb_visiteurs,
         items=items_page,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PARTENAIRE — RÉSERVATIONS DE SES HÔTELS
+#  ⚠️  DOIT être AVANT /{reservation_id}
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Schémas dédiés partenaire ─────────────────────────────────────────────────
+
+class PartenaireHotelStats(_BM):
+    hotel_id:          int
+    hotel_nom:         str
+    hotel_ville:       str
+    hotel_image:       Optional[str] = None
+    nb_reservations:   int
+    nb_clients:        int
+    nb_visiteurs:      int
+    ca_total:          float
+
+
+class PartenaireHotelListResponse(_BM):
+    items: List[PartenaireHotelStats]
+
+
+class PartenaireResaItem(_BM):
+    id:                int
+    source:            str          # "client" | "visiteur"
+    date_reservation:  str
+    date_debut:        str
+    date_fin:          str
+    nb_nuits:          int
+    statut:            str
+    total_ttc:         float
+    client_nom:        str
+    client_prenom:     str
+    client_email:      str
+    client_telephone:  Optional[str] = None
+    chambre_nom:       Optional[str] = None
+    numero_facture:    Optional[str] = None
+    statut_facture:    Optional[str] = None
+    numero_voucher:    Optional[str] = None
+    methode_paiement:  Optional[str] = None
+    nb_adultes:        int
+    nb_enfants:        int
+
+
+class PartenaireResaListResponse(_BM):
+    hotel_id:     int
+    hotel_nom:    str
+    total:        int
+    nb_clients:   int
+    nb_visiteurs: int
+    items:        List[PartenaireResaItem]
+
+
+# ── Helpers internes partenaire ───────────────────────────────────────────────
+
+async def _hotel_appartient_partenaire(hotel_id: int, partenaire_id: int, session) -> bool:
+    """Vérifie que l'hôtel appartient bien au partenaire connecté."""
+    from app.models.hotel import Hotel
+    res = await session.execute(
+        _sel(Hotel).where(Hotel.id == hotel_id, Hotel.id_partenaire == partenaire_id)
+    )
+    return res.scalar_one_or_none() is not None
+
+
+async def _get_chambre_ids_hotel(hotel_id: int, session) -> list:
+    """Retourne la liste des id des chambres d'un hôtel."""
+    res = await session.execute(
+        _sel(_Ch.id).where(_Ch.id_hotel == hotel_id)
+    )
+    return [r[0] for r in res.all()]
+
+
+async def _get_chambre_nom(id_chambre: int, session) -> str:
+    """Retourne le nom du type de chambre depuis un id_chambre."""
+    from app.models.hotel import TypeChambre
+    ch_res = await session.execute(_sel(_Ch).where(_Ch.id == id_chambre))
+    ch = ch_res.scalar_one_or_none()
+    if not ch:
+        return f"Chambre #{id_chambre}"
+    if ch.id_type_chambre:
+        tc_res = await session.execute(
+            _sel(TypeChambre).where(TypeChambre.id == ch.id_type_chambre)
+        )
+        tc = tc_res.scalar_one_or_none()
+        return tc.nom if tc else f"Chambre #{id_chambre}"
+    return f"Chambre #{id_chambre}"
+
+
+# ── Route 1 : liste hôtels du partenaire avec stats ──────────────────────────
+
+@router.get(
+    "/partenaire/mes-hotels",
+    response_model=PartenaireHotelListResponse,
+    summary="Hôtels du partenaire avec stats réservations [PARTENAIRE]",
+)
+async def partenaire_mes_hotels(
+    session: AsyncSession = Depends(get_db),
+    token:   TokenData    = Depends(require_partenaire),
+):
+    from app.models.hotel import Hotel
+    from app.models.image import Image as _Img
+    from app.models.reservation import LigneReservationChambre
+
+    # 1. Récupérer les hôtels du partenaire (actifs uniquement)
+    res = await session.execute(
+        _sel(Hotel)
+        .where(Hotel.id_partenaire == token.user_id, Hotel.actif == True)
+        .order_by(Hotel.nom.asc())
+    )
+    hotels = res.scalars().all()
+
+    items = []
+    for hotel in hotels:
+        chambre_ids = await _get_chambre_ids_hotel(hotel.id, session)
+
+        nb_clients   = 0
+        nb_visiteurs = 0
+        ca_total     = 0.0
+
+        if chambre_ids:
+            # Réservations clients (via ligne_reservation_chambre)
+            lrc_res = await session.execute(
+                _sel(LigneReservationChambre.id_reservation)
+                .where(LigneReservationChambre.id_chambre.in_(chambre_ids))
+                .distinct()
+            )
+            resa_ids = [r[0] for r in lrc_res.all()]
+
+            if resa_ids:
+                count_res = await session.execute(
+                    _sel(
+                        _func.count(Reservation.id),
+                        _func.coalesce(_func.sum(Reservation.total_ttc), 0),
+                    ).where(Reservation.id.in_(resa_ids))
+                )
+                row = count_res.one()
+                nb_clients = row[0] or 0
+                ca_total  += float(row[1] or 0)
+
+            # Réservations visiteurs
+            vis_count_res = await session.execute(
+                _sel(
+                    _func.count(_RV.id),
+                    _func.coalesce(_func.sum(_RV.total_ttc), 0),
+                ).where(_RV.id_chambre.in_(chambre_ids))
+            )
+            vis_row = vis_count_res.one()
+            nb_visiteurs = vis_row[0] or 0
+            ca_total    += float(vis_row[1] or 0)
+
+        # Image principale
+        img_res = await session.execute(
+            _sel(_Img.url)
+            .where(_Img.id_hotel == hotel.id, _Img.type == "PRINCIPALE")
+            .limit(1)
+        )
+        img_url = img_res.scalar_one_or_none()
+        # Si pas de PRINCIPALE, prendre la première image disponible
+        if not img_url:
+            img_res2 = await session.execute(
+                _sel(_Img.url).where(_Img.id_hotel == hotel.id).limit(1)
+            )
+            img_url = img_res2.scalar_one_or_none()
+
+        items.append(PartenaireHotelStats(
+            hotel_id        = hotel.id,
+            hotel_nom       = hotel.nom,
+            hotel_ville     = hotel.ville or "—",
+            hotel_image     = img_url,
+            nb_reservations = nb_clients + nb_visiteurs,
+            nb_clients      = nb_clients,
+            nb_visiteurs    = nb_visiteurs,
+            ca_total        = round(ca_total, 2),
+        ))
+
+    return PartenaireHotelListResponse(items=items)
+
+
+# ── Route 2 : réservations d'un hôtel spécifique ─────────────────────────────
+
+@router.get(
+    "/partenaire/hotel/{hotel_id}",
+    response_model=PartenaireResaListResponse,
+    summary="Réservations d'un hôtel [PARTENAIRE]",
+)
+async def partenaire_reservations_hotel(
+    hotel_id:       int,
+    # ── Filtres ────────────────────────────────────────────
+    source:         Optional[str] = Query(None, description="client | visiteur"),
+    statut:         Optional[str] = Query(None, description="EN_ATTENTE | CONFIRMEE | ANNULEE | TERMINEE"),
+    search:         Optional[str] = Query(None, description="Nom, prénom, email ou téléphone"),
+    numero_facture: Optional[str] = Query(None, description="Numéro de facture (clients) ou voucher (visiteurs)"),
+    # ──────────────────────────────────────────────────────
+    session:        AsyncSession  = Depends(get_db),
+    token:          TokenData     = Depends(require_partenaire),
+):
+    from app.models.hotel import Hotel
+    from app.models.reservation import LigneReservationChambre, StatutReservation
+    from app.models.utilisateur import Utilisateur as _Usr
+
+    # ── Vérification ownership ────────────────────────────
+    if not await _hotel_appartient_partenaire(hotel_id, token.user_id, session):
+        raise HTTPException(status_code=403, detail="Cet hôtel ne vous appartient pas.")
+
+    # ── Nom de l'hôtel ────────────────────────────────────
+    hotel_res = await session.execute(_sel(Hotel).where(Hotel.id == hotel_id))
+    hotel     = hotel_res.scalar_one_or_none()
+    hotel_nom = hotel.nom if hotel else f"Hôtel #{hotel_id}"
+
+    # ── IDs des chambres de l'hôtel ───────────────────────
+    chambre_ids = await _get_chambre_ids_hotel(hotel_id, session)
+
+    items: List[PartenaireResaItem] = []
+
+    if not chambre_ids:
+        return PartenaireResaListResponse(
+            hotel_id=hotel_id, hotel_nom=hotel_nom,
+            total=0, nb_clients=0, nb_visiteurs=0, items=[],
+        )
+
+    # ══════════════════════════
+    #  CLIENTS (table reservation)
+    # ══════════════════════════
+    if source in (None, "client"):
+        # Trouver les id_reservation concernant ces chambres
+        lrc_res = await session.execute(
+            _sel(LigneReservationChambre)
+            .where(LigneReservationChambre.id_chambre.in_(chambre_ids))
+        )
+        lignes   = lrc_res.scalars().all()
+        resa_ids = list({l.id_reservation for l in lignes})
+
+        if resa_ids:
+            query = _sel(Reservation).where(Reservation.id.in_(resa_ids))
+
+            # Filtre statut
+            if statut:
+                try:
+                    query = query.where(Reservation.statut == StatutReservation(statut))
+                except ValueError:
+                    pass
+
+            query = query.order_by(Reservation.date_reservation.desc())
+            resa_result = await session.execute(
+                query.options(
+                    _sil(Reservation.lignes_chambres),
+                    _sil(Reservation.facture),
+                )
+            )
+            resas = resa_result.scalars().all()
+
+            for resa in resas:
+                # Charger le client
+                usr_res = await session.execute(_sel(_Usr).where(_Usr.id == resa.id_client))
+                usr = usr_res.scalar_one_or_none()
+
+                # Filtre search (nom/prénom/email/téléphone)
+                if search and usr:
+                    s = search.lower()
+                    haystack = (
+                        f"{usr.nom} {usr.prenom} {usr.email} "
+                        f"{getattr(usr, 'telephone', '') or ''}"
+                    ).lower()
+                    if s not in haystack:
+                        continue
+                elif search and not usr:
+                    continue
+
+                # Filtre numéro facture
+                if numero_facture:
+                    fac_num = resa.facture.numero if resa.facture else ""
+                    if numero_facture.lower() not in (fac_num or "").lower():
+                        continue
+
+                # Chambre et nb_adultes/nb_enfants (première ligne)
+                lrc = next(
+                    (l for l in lignes if l.id_reservation == resa.id),
+                    resa.lignes_chambres[0] if resa.lignes_chambres else None,
+                )
+                ch_id  = lrc.id_chambre if lrc else None
+                ch_nom = await _get_chambre_nom(ch_id, session) if ch_id else "—"
+
+                items.append(PartenaireResaItem(
+                    id               = resa.id,
+                    source           = "client",
+                    date_reservation = resa.date_reservation.strftime("%d/%m/%Y %H:%M"),
+                    date_debut       = str(resa.date_debut),
+                    date_fin         = str(resa.date_fin),
+                    nb_nuits         = (resa.date_fin - resa.date_debut).days,
+                    statut           = resa.statut.value,
+                    total_ttc        = float(resa.total_ttc),
+                    client_nom       = usr.nom       if usr else "—",
+                    client_prenom    = usr.prenom    if usr else "—",
+                    client_email     = usr.email     if usr else "—",
+                    client_telephone = getattr(usr, "telephone", None),
+                    chambre_nom      = ch_nom,
+                    numero_facture   = resa.facture.numero       if resa.facture else None,
+                    statut_facture   = resa.facture.statut.value if resa.facture else None,
+                    numero_voucher   = None,
+                    methode_paiement = None,
+                    nb_adultes       = lrc.nb_adultes if lrc else 0,
+                    nb_enfants       = lrc.nb_enfants if lrc else 0,
+                ))
+
+    nb_clients = len(items)
+
+    # ══════════════════════════
+    #  VISITEURS (table reservation_visiteur)
+    # ══════════════════════════
+    if source in (None, "visiteur"):
+        vis_query = _sel(_RV).where(_RV.id_chambre.in_(chambre_ids))
+
+        # Filtre statut (colonne String dans reservation_visiteur)
+        if statut:
+            vis_query = vis_query.where(_RV.statut == statut)
+
+        vis_query = vis_query.order_by(_RV.created_at.desc())
+        vis_result = await session.execute(vis_query)
+        visiteurs  = vis_result.scalars().all()
+
+        for vis in visiteurs:
+            # Filtre search
+            if search:
+                s = search.lower()
+                haystack = (
+                    f"{vis.nom} {vis.prenom} {vis.email} {vis.telephone or ''}"
+                ).lower()
+                if s not in haystack:
+                    continue
+
+            # Filtre numéro voucher
+            if numero_facture:
+                if numero_facture.lower() not in (vis.numero_voucher or "").lower():
+                    continue
+
+            ch_nom = await _get_chambre_nom(vis.id_chambre, session)
+
+            items.append(PartenaireResaItem(
+                id               = vis.id,
+                source           = "visiteur",
+                date_reservation = vis.created_at.strftime("%d/%m/%Y %H:%M"),
+                date_debut       = str(vis.date_debut),
+                date_fin         = str(vis.date_fin),
+                nb_nuits         = (vis.date_fin - vis.date_debut).days,
+                statut           = vis.statut,
+                total_ttc        = float(vis.total_ttc),
+                client_nom       = vis.nom,
+                client_prenom    = vis.prenom,
+                client_email     = vis.email,
+                client_telephone = vis.telephone,
+                chambre_nom      = ch_nom,
+                numero_facture   = None,
+                statut_facture   = None,
+                numero_voucher   = vis.numero_voucher,
+                methode_paiement = vis.methode_paiement,
+                nb_adultes       = vis.nb_adultes,
+                nb_enfants       = vis.nb_enfants,
+            ))
+
+    nb_visiteurs = len(items) - nb_clients
+
+    # Tri final par date décroissante (mélange client + visiteur)
+    items.sort(key=lambda x: x.date_reservation, reverse=True)
+
+    return PartenaireResaListResponse(
+        hotel_id     = hotel_id,
+        hotel_nom    = hotel_nom,
+        total        = len(items),
+        nb_clients   = nb_clients,
+        nb_visiteurs = nb_visiteurs,
+        items        = items,
     )
 
 
 # ══════════════════════════════════════════════════════════
 #  DÉTAIL
+#  ⚠️  Route dynamique — DOIT rester après toutes les routes statiques
 # ══════════════════════════════════════════════════════════
 @router.get("/{reservation_id}", response_model=ReservationResponse,
             summary="Détail réservation [CLIENT|ADMIN]")

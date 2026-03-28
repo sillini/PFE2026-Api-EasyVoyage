@@ -4,12 +4,14 @@ from typing import Optional, List
 from pydantic import BaseModel, Field
 
 
-# ── Utilisateur compact ───────────────────────────────────
+# ── Utilisateur compact (enrichi pour la recherche admin) ─
 class UserCompact(BaseModel):
-    id:     int
-    nom:    str
-    prenom: str
-    role:   str
+    id:          int
+    nom:         str
+    prenom:      str
+    role:        str
+    email:       Optional[str]       = None   # ← AJOUTÉ : recherche par email
+    hotels_noms: Optional[List[str]] = None   # ← AJOUTÉ : noms des hôtels du partenaire
     model_config = {"from_attributes": True}
 
 
@@ -32,6 +34,12 @@ class MessageResponse(BaseModel):
 # ── Conversation ──────────────────────────────────────────
 class ConversationCreate(BaseModel):
     sujet: str = Field("Support général", min_length=2, max_length=300)
+
+
+class AdminConversationCreate(BaseModel):
+    id_partenaire:   int = Field(..., description="ID du partenaire à contacter")
+    sujet:           str = Field("Message de l'administration", min_length=2, max_length=300)
+    premier_message: Optional[str] = Field(None, max_length=5000)
 
 
 class ConversationResponse(BaseModel):
