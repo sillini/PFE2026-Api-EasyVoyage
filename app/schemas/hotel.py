@@ -10,42 +10,26 @@ from pydantic import BaseModel, Field, field_validator
 # ═══════════════════════════════════════════════════════════
 #  DISPONIBILITE
 # ═══════════════════════════════════════════════════════════
-class ReservationOccupation(BaseModel):
-    """Représente une période d'occupation d'une chambre."""
-    id_reservation: int
+class OccupationPeriode(BaseModel):
     date_debut: date
-    date_fin: date
-    statut: str
+    date_fin:   date
     model_config = {"from_attributes": True}
 
 
 class ChambreDisponibiliteResponse(BaseModel):
-    """Disponibilité d'une chambre sur une période."""
-    id_chambre: int
-    disponible: bool
-    occupations: List[ReservationOccupation] = []
-    message: str
+    chambre_id:  int
+    disponible:  bool
+    occupations: List[OccupationPeriode] = []
+    prix_min:    Optional[float] = None
+    prix_max:    Optional[float] = None
+    model_config = {"from_attributes": True}
 
 
 class HotelDisponibilitesResponse(BaseModel):
-    """Disponibilités de toutes les chambres d'un hôtel."""
-    hotel_id: int
+    hotel_id:   int
     date_debut: date
-    date_fin: date
-    chambres: List["ChambreDisponibiliteDetailResponse"]
-
-
-class ChambreDisponibiliteDetailResponse(BaseModel):
-    """Détail d'une chambre avec sa disponibilité."""
-    id: int
-    capacite: int
-    description: Optional[str]
-    type_chambre: Optional["TypeChambreResponse"] = None
-    actif: bool
-    disponible: bool
-    occupations: List[ReservationOccupation] = []
-    prix_min: Optional[float] = None
-    prix_max: Optional[float] = None
+    date_fin:   date
+    chambres:   List[ChambreDisponibiliteResponse]
     model_config = {"from_attributes": True}
 
 
@@ -53,37 +37,37 @@ class ChambreDisponibiliteDetailResponse(BaseModel):
 #  HOTEL
 # ═══════════════════════════════════════════════════════════
 class HotelCreate(BaseModel):
-    nom:         str          = Field(..., min_length=2, max_length=200)
-    etoiles:     int          = Field(..., ge=1, le=5)
-    adresse:     str          = Field(..., max_length=500)
-    ville:       str          = Field("Tunis", max_length=100)
-    pays:        str          = Field("Tunisie", max_length=100)
+    nom:         str           = Field(..., min_length=2, max_length=200)
+    etoiles:     int           = Field(..., ge=1, le=5)
+    adresse:     str           = Field(..., max_length=500)
+    ville:       str           = Field("Tunis", max_length=100)
+    pays:        str           = Field("Tunisie", max_length=100)
     description: Optional[str] = None
 
 
-# Admin peut UNIQUEMENT changer actif — pas les autres champs
 class HotelAdminUpdate(BaseModel):
     actif: bool
+
 
 class HotelFeaturedUpdate(BaseModel):
     mis_en_avant: bool
 
 
 class HotelUpdate(BaseModel):
-    nom:         Optional[str] = Field(None, min_length=2, max_length=200)
-    etoiles:     Optional[int] = Field(None, ge=1, le=5)
-    adresse:     Optional[str] = Field(None, max_length=500)
-    ville:       Optional[str] = Field(None, max_length=100)
-    pays:        Optional[str] = Field(None, max_length=100)
-    description: Optional[str] = None
+    nom:         Optional[str]  = Field(None, min_length=2, max_length=200)
+    etoiles:     Optional[int]  = Field(None, ge=1, le=5)
+    adresse:     Optional[str]  = Field(None, max_length=500)
+    ville:       Optional[str]  = Field(None, max_length=100)
+    pays:        Optional[str]  = Field(None, max_length=100)
+    description: Optional[str]  = None
     actif:       Optional[bool] = None
 
 
 class PartenaireInfo(BaseModel):
-    id: int
-    nom: str
+    id:     int
+    nom:    str
     prenom: str
-    email: str
+    email:  str
     model_config = {"from_attributes": True}
 
 
@@ -92,13 +76,13 @@ class HotelResponse(BaseModel):
     nom:           str
     etoiles:       int
     adresse:       str
-    ville:         Optional[str] = None
+    ville:         Optional[str]          = None
     pays:          str
     description:   Optional[str]
     note_moyenne:  Optional[float]
     actif:         bool
-    mis_en_avant:  bool = False
-    id_partenaire: Optional[int] = None
+    mis_en_avant:  bool                   = False
+    id_partenaire: Optional[int]          = None
     partenaire:    Optional[PartenaireInfo] = None
     created_at:    datetime
     updated_at:    datetime
@@ -110,9 +94,11 @@ class VilleVedetteCreate(BaseModel):
     ordre: int  = Field(0, ge=0)
     actif: bool = True
 
+
 class VilleVedetteUpdate(BaseModel):
     ordre: Optional[int]  = None
     actif: Optional[bool] = None
+
 
 class VilleVedetteResponse(BaseModel):
     id:    int
@@ -123,18 +109,18 @@ class VilleVedetteResponse(BaseModel):
 
 
 class HotelListResponse(BaseModel):
-    total: int
-    page: int
+    total:    int
+    page:     int
     per_page: int
-    items: List[HotelResponse]
+    items:    List[HotelResponse]
 
 
 # ═══════════════════════════════════════════════════════════
 #  TYPE CHAMBRE
 # ═══════════════════════════════════════════════════════════
 class TypeChambreResponse(BaseModel):
-    id: int
-    nom: str
+    id:          int
+    nom:         str
     description: Optional[str]
     model_config = {"from_attributes": True}
 
@@ -143,31 +129,30 @@ class TypeChambreResponse(BaseModel):
 #  CHAMBRE
 # ═══════════════════════════════════════════════════════════
 class ChambreCreate(BaseModel):
-    capacite: int = Field(..., gt=0, examples=[2])
-    description: Optional[str] = Field(None, examples=["Chambre avec vue sur mer"])
-    id_type_chambre: int = Field(..., examples=[1])
+    capacite:        int           = Field(..., gt=0, examples=[2])
+    description:     Optional[str] = Field(None, examples=["Chambre avec vue sur mer"])
+    id_type_chambre: int           = Field(..., examples=[1])
 
 
 class ChambreUpdate(BaseModel):
-    capacite: Optional[int] = Field(None, gt=0)
-    description: Optional[str] = None
-    id_type_chambre: Optional[int] = None
-    actif: Optional[bool] = None
+    capacite:        Optional[int]  = Field(None, gt=0)
+    description:     Optional[str]  = None
+    id_type_chambre: Optional[int]  = None
+    actif:           Optional[bool] = None
 
 
 class ChambreResponse(BaseModel):
-    id: int
-    capacite: int
-    description: Optional[str]
-    id_hotel: int
+    id:              int
+    capacite:        int
+    description:     Optional[str]
+    id_hotel:        int
     id_type_chambre: int
-    type_chambre: Optional[TypeChambreResponse] = None
-    actif: bool
-    created_at: datetime
-    updated_at: datetime
-    # Tarif courant (calculé à la volée)
-    prix_min: Optional[float] = None
-    prix_max: Optional[float] = None
+    type_chambre:    Optional[TypeChambreResponse] = None
+    actif:           bool
+    created_at:      datetime
+    updated_at:      datetime
+    prix_min:        Optional[float] = None
+    prix_max:        Optional[float] = None
     model_config = {"from_attributes": True}
 
 
@@ -180,8 +165,8 @@ class ChambreListResponse(BaseModel):
 #  TYPE RESERVATION
 # ═══════════════════════════════════════════════════════════
 class TypeReservationResponse(BaseModel):
-    id: int
-    nom: str
+    id:          int
+    nom:         str
     description: Optional[str]
     model_config = {"from_attributes": True}
 
@@ -190,10 +175,10 @@ class TypeReservationResponse(BaseModel):
 #  TARIF
 # ═══════════════════════════════════════════════════════════
 class TarifCreate(BaseModel):
-    prix: float = Field(..., ge=0, examples=[150.00])
-    date_debut: date = Field(..., examples=["2026-06-01"])
-    date_fin: date = Field(..., examples=["2026-08-31"])
-    id_type_reservation: int = Field(..., examples=[1])
+    prix:                float = Field(..., ge=0, examples=[150.00])
+    date_debut:          date  = Field(..., examples=["2026-06-01"])
+    date_fin:            date  = Field(..., examples=["2026-08-31"])
+    id_type_reservation: int   = Field(..., examples=[1])
 
     @field_validator("date_fin")
     @classmethod
@@ -204,10 +189,10 @@ class TarifCreate(BaseModel):
 
 
 class TarifUpdate(BaseModel):
-    prix: Optional[float] = Field(None, ge=0)
-    date_debut: Optional[date] = None
-    date_fin: Optional[date] = None
-    id_type_reservation: Optional[int] = None
+    prix:                Optional[float] = Field(None, ge=0)
+    date_debut:          Optional[date]  = None
+    date_fin:            Optional[date]  = None
+    id_type_reservation: Optional[int]   = None
 
     @field_validator("date_fin")
     @classmethod
@@ -218,14 +203,14 @@ class TarifUpdate(BaseModel):
 
 
 class TarifResponse(BaseModel):
-    id: int
-    prix: float
-    date_debut: date
-    date_fin: date
-    id_chambre: int
+    id:                  int
+    prix:                float
+    date_debut:          date
+    date_fin:            date
+    id_chambre:          int
     id_type_reservation: int
-    type_reservation: Optional[TypeReservationResponse] = None
-    created_at: datetime
+    type_reservation:    Optional[TypeReservationResponse] = None
+    created_at:          datetime
     model_config = {"from_attributes": True}
 
 
@@ -237,24 +222,35 @@ class TarifListResponse(BaseModel):
 # ═══════════════════════════════════════════════════════════
 #  AVIS
 # ═══════════════════════════════════════════════════════════
+
+# ✅ Info client — construite manuellement dans le service (pas via ORM relation)
+# Le modèle Avis n'a PAS de relation .client — on charge Utilisateur séparément
+class AvisClientInfo(BaseModel):
+    id:     int
+    prenom: str
+    nom:    str
+    model_config = {"from_attributes": True}
+
+
 class AvisCreate(BaseModel):
-    note: int = Field(..., ge=1, le=5, examples=[4])
+    note:        int           = Field(..., ge=1, le=5, examples=[4])
     commentaire: Optional[str] = Field(None, examples=["Excellent hôtel, service impeccable"])
 
 
 class AvisResponse(BaseModel):
-    id: int
-    note: int
+    id:          int
+    note:        int
     commentaire: Optional[str]
-    date: datetime
-    id_client: int
-    id_hotel: int
-    created_at: datetime
+    date:        datetime
+    id_client:   int
+    id_hotel:    int
+    created_at:  datetime
+    # ✅ Chargé manuellement dans list_avis / create_avis via jointure Utilisateur
+    client:      Optional[AvisClientInfo] = None
     model_config = {"from_attributes": True}
 
 
 class AvisListResponse(BaseModel):
-    total: int
+    total:        int
     note_moyenne: float
-    items: List[AvisResponse]
-
+    items:        List[AvisResponse]

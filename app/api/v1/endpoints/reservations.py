@@ -16,6 +16,9 @@ Routes :
   POST  /reservations/{id}/annuler                  → Annuler [CLIENT|ADMIN]
   GET   /reservations/visiteur/{v}/pdf              → Voucher PDF visiteur hôtel
   GET   /reservations/{id}/voucher-pdf              → Voucher PDF client (hôtel ou voyage)
+
+  💡 Les commissions partenaires (10%) sont créées automatiquement
+     par le trigger PostgreSQL trg_commission_auto sur voyage_hotel.reservation.
 """
 from typing import Optional, List
 import asyncio as _asyncio
@@ -502,8 +505,6 @@ async def list_reservations_enrichi(
 #  ⚠️  DOIT être AVANT /{reservation_id}
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Schémas dédiés partenaire ─────────────────────────────────────────────────
-
 class PartenaireHotelStats(_BM):
     hotel_id:          int
     hotel_nom:         str
@@ -521,7 +522,7 @@ class PartenaireHotelListResponse(_BM):
 
 class PartenaireResaItem(_BM):
     id:                int
-    source:            str          # "client" | "visiteur"
+    source:            str
     date_reservation:  str
     date_debut:        str
     date_fin:          str
@@ -549,8 +550,6 @@ class PartenaireResaListResponse(_BM):
     nb_visiteurs: int
     items:        List[PartenaireResaItem]
 
-
-# ── Helpers internes partenaire ───────────────────────────────────────────────
 
 async def _hotel_appartient_partenaire(hotel_id: int, partenaire_id: int, session) -> bool:
     """Vérifie que l'hôtel appartient bien au partenaire connecté."""
@@ -585,8 +584,6 @@ async def _get_chambre_nom(id_chambre: int, session) -> str:
     return f"Chambre #{id_chambre}"
 
 
-# ── Route 1 : liste hôtels du partenaire avec stats ──────────────────────────
-
 @router.get(
     "/partenaire/mes-hotels",
     response_model=PartenaireHotelListResponse,
@@ -600,7 +597,6 @@ async def partenaire_mes_hotels(
     from app.models.image import Image as _Img
     from app.models.reservation import LigneReservationChambre
 
-    # 1. Récupérer les hôtels du partenaire (actifs uniquement)
     res = await session.execute(
         _sel(Hotel)
         .where(Hotel.id_partenaire == token.user_id, Hotel.actif == True)
@@ -617,7 +613,6 @@ async def partenaire_mes_hotels(
         ca_total     = 0.0
 
         if chambre_ids:
-            # Réservations clients (via ligne_reservation_chambre)
             lrc_res = await session.execute(
                 _sel(LigneReservationChambre.id_reservation)
                 .where(LigneReservationChambre.id_chambre.in_(chambre_ids))
@@ -636,7 +631,6 @@ async def partenaire_mes_hotels(
                 nb_clients = row[0] or 0
                 ca_total  += float(row[1] or 0)
 
-            # Réservations visiteurs
             vis_count_res = await session.execute(
                 _sel(
                     _func.count(_RV.id),
@@ -647,14 +641,12 @@ async def partenaire_mes_hotels(
             nb_visiteurs = vis_row[0] or 0
             ca_total    += float(vis_row[1] or 0)
 
-        # Image principale
         img_res = await session.execute(
             _sel(_Img.url)
             .where(_Img.id_hotel == hotel.id, _Img.type == "PRINCIPALE")
             .limit(1)
         )
         img_url = img_res.scalar_one_or_none()
-        # Si pas de PRINCIPALE, prendre la première image disponible
         if not img_url:
             img_res2 = await session.execute(
                 _sel(_Img.url).where(_Img.id_hotel == hotel.id).limit(1)
@@ -675,8 +667,6 @@ async def partenaire_mes_hotels(
     return PartenaireHotelListResponse(items=items)
 
 
-# ── Route 2 : réservations d'un hôtel spécifique ─────────────────────────────
-
 @router.get(
     "/partenaire/hotel/{hotel_id}",
     response_model=PartenaireResaListResponse,
@@ -684,12 +674,10 @@ async def partenaire_mes_hotels(
 )
 async def partenaire_reservations_hotel(
     hotel_id:       int,
-    # ── Filtres ────────────────────────────────────────────
     source:         Optional[str] = Query(None, description="client | visiteur"),
     statut:         Optional[str] = Query(None, description="EN_ATTENTE | CONFIRMEE | ANNULEE | TERMINEE"),
     search:         Optional[str] = Query(None, description="Nom, prénom, email ou téléphone"),
     numero_facture: Optional[str] = Query(None, description="Numéro de facture (clients) ou voucher (visiteurs)"),
-    # ──────────────────────────────────────────────────────
     session:        AsyncSession  = Depends(get_db),
     token:          TokenData     = Depends(require_partenaire),
 ):
@@ -697,16 +685,13 @@ async def partenaire_reservations_hotel(
     from app.models.reservation import LigneReservationChambre, StatutReservation
     from app.models.utilisateur import Utilisateur as _Usr
 
-    # ── Vérification ownership ────────────────────────────
     if not await _hotel_appartient_partenaire(hotel_id, token.user_id, session):
         raise HTTPException(status_code=403, detail="Cet hôtel ne vous appartient pas.")
 
-    # ── Nom de l'hôtel ────────────────────────────────────
     hotel_res = await session.execute(_sel(Hotel).where(Hotel.id == hotel_id))
     hotel     = hotel_res.scalar_one_or_none()
     hotel_nom = hotel.nom if hotel else f"Hôtel #{hotel_id}"
 
-    # ── IDs des chambres de l'hôtel ───────────────────────
     chambre_ids = await _get_chambre_ids_hotel(hotel_id, session)
 
     items: List[PartenaireResaItem] = []
@@ -717,11 +702,8 @@ async def partenaire_reservations_hotel(
             total=0, nb_clients=0, nb_visiteurs=0, items=[],
         )
 
-    # ══════════════════════════
-    #  CLIENTS (table reservation)
-    # ══════════════════════════
+    # ── CLIENTS ───────────────────────────────────────────
     if source in (None, "client"):
-        # Trouver les id_reservation concernant ces chambres
         lrc_res = await session.execute(
             _sel(LigneReservationChambre)
             .where(LigneReservationChambre.id_chambre.in_(chambre_ids))
@@ -731,14 +713,11 @@ async def partenaire_reservations_hotel(
 
         if resa_ids:
             query = _sel(Reservation).where(Reservation.id.in_(resa_ids))
-
-            # Filtre statut
             if statut:
                 try:
                     query = query.where(Reservation.statut == StatutReservation(statut))
                 except ValueError:
                     pass
-
             query = query.order_by(Reservation.date_reservation.desc())
             resa_result = await session.execute(
                 query.options(
@@ -749,11 +728,9 @@ async def partenaire_reservations_hotel(
             resas = resa_result.scalars().all()
 
             for resa in resas:
-                # Charger le client
                 usr_res = await session.execute(_sel(_Usr).where(_Usr.id == resa.id_client))
                 usr = usr_res.scalar_one_or_none()
 
-                # Filtre search (nom/prénom/email/téléphone)
                 if search and usr:
                     s = search.lower()
                     haystack = (
@@ -765,13 +742,11 @@ async def partenaire_reservations_hotel(
                 elif search and not usr:
                     continue
 
-                # Filtre numéro facture
                 if numero_facture:
                     fac_num = resa.facture.numero if resa.facture else ""
                     if numero_facture.lower() not in (fac_num or "").lower():
                         continue
 
-                # Chambre et nb_adultes/nb_enfants (première ligne)
                 lrc = next(
                     (l for l in lignes if l.id_reservation == resa.id),
                     resa.lignes_chambres[0] if resa.lignes_chambres else None,
@@ -803,22 +778,16 @@ async def partenaire_reservations_hotel(
 
     nb_clients = len(items)
 
-    # ══════════════════════════
-    #  VISITEURS (table reservation_visiteur)
-    # ══════════════════════════
+    # ── VISITEURS ─────────────────────────────────────────
     if source in (None, "visiteur"):
         vis_query = _sel(_RV).where(_RV.id_chambre.in_(chambre_ids))
-
-        # Filtre statut (colonne String dans reservation_visiteur)
         if statut:
             vis_query = vis_query.where(_RV.statut == statut)
-
         vis_query = vis_query.order_by(_RV.created_at.desc())
         vis_result = await session.execute(vis_query)
         visiteurs  = vis_result.scalars().all()
 
         for vis in visiteurs:
-            # Filtre search
             if search:
                 s = search.lower()
                 haystack = (
@@ -827,7 +796,6 @@ async def partenaire_reservations_hotel(
                 if s not in haystack:
                     continue
 
-            # Filtre numéro voucher
             if numero_facture:
                 if numero_facture.lower() not in (vis.numero_voucher or "").lower():
                     continue
@@ -857,8 +825,6 @@ async def partenaire_reservations_hotel(
             ))
 
     nb_visiteurs = len(items) - nb_clients
-
-    # Tri final par date décroissante (mélange client + visiteur)
     items.sort(key=lambda x: x.date_reservation, reverse=True)
 
     return PartenaireResaListResponse(
@@ -889,6 +855,8 @@ async def get_reservation(
 
 # ══════════════════════════════════════════════════════════
 #  PAYER
+#  💡 Commission créée automatiquement par le trigger SQL
+#     trg_commission_auto sur voyage_hotel.reservation
 # ══════════════════════════════════════════════════════════
 @router.post("/{reservation_id}/paiement", response_model=FactureResponse,
              status_code=status.HTTP_201_CREATED,
@@ -1128,7 +1096,7 @@ async def download_voucher_visiteur(
 
 
 # ══════════════════════════════════════════════════════════
-#  VOUCHER PDF — CLIENT (hôtel ou voyage automatique)
+#  VOUCHER PDF — CLIENT (hôtel ou voyage)
 # ══════════════════════════════════════════════════════════
 @router.get("/{reservation_id}/voucher-pdf", summary="Voucher PDF client")
 async def download_voucher_client(
