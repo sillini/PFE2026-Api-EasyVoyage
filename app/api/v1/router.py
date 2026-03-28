@@ -14,6 +14,8 @@ from app.api.v1.endpoints import partenaires
 from app.api.v1.endpoints import hero_slides
 from app.api.v1.endpoints import support
 from app.api.v1.endpoints import clients
+from app.api.v1.endpoints import favoris
+
 from app.api.v1.endpoints.demandes_partenaire import (
     public_router as demandes_public_router,
     admin_router  as demandes_admin_router,
@@ -34,3 +36,4 @@ api_v1_router.include_router(support.router)
 api_v1_router.include_router(clients.router)
 api_v1_router.include_router(demandes_public_router)
 api_v1_router.include_router(demandes_admin_router)
+api_v1_router.include_router(favoris.router)
