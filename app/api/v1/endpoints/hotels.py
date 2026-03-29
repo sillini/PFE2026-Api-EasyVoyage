@@ -1,23 +1,10 @@
 """
-app/api/v1/endpoints/hotels.py — VERSION FINALE CORRIGÉE
+app/api/v1/endpoints/hotels.py — VERSION MISE À JOUR
 
-CORRECTION CRITIQUE :
-  create_avis appelait hotel_service.create_avis(hotel_id, data, session, current_user.user_id)
-  → session passé comme client_id → crash 500
-
-  CORRECT : hotel_service.create_avis(hotel_id, data, current_user.user_id, session)
-                                                       ^^^^^^^^^^^^^^^^^^ ^^^^^^
-                                                       client_id AVANT    session EN DERNIER
-
-ORDRE ROUTES FastAPI (statiques AVANT dynamiques) :
-  ① GET ""               → liste publique
-  ② /types-chambre
-  ③ /types-reservation
-  ④ /featured            ← AVANT /{hotel_id}
-  ⑤ /villes-vedettes     ← AVANT /{hotel_id}
-  ⑥ /mes-hotels          ← AVANT /{hotel_id}  [PARTENAIRE]
-  ⑦ /admin/...           ← AVANT /{hotel_id}  [ADMIN]
-  ⑧ /{hotel_id}          ← EN DERNIER
+Ajouts :
+  - GET /{hotel_id}/disponibilites/public  → endpoint sans auth pour visiteurs/clients
+    (les types entièrement réservés sont masqués)
+  - GET /{hotel_id}/disponibilites         → passe maintenant le rôle au service
 """
 from datetime import date
 from typing import Optional
@@ -305,19 +292,54 @@ async def delete_chambre(
 #  DISPONIBILITÉS
 # ═══════════════════════════════════════════════════════════
 
-@router.get("/{hotel_id}/disponibilites", response_model=HotelDisponibilitesResponse,
-            summary="Disponibilités [ADMIN | PARTENAIRE]")
-async def get_hotel_disponibilites(
-    hotel_id: int,
+@router.get(
+    "/{hotel_id}/disponibilites/public",
+    response_model=HotelDisponibilitesResponse,
+    summary="Disponibilités publiques — chambres disponibles uniquement [PUBLIC]",
+)
+async def get_hotel_disponibilites_public(
+    hotel_id:   int,
     date_debut: date = Query(...),
     date_fin:   date = Query(...),
     session: AsyncSession = Depends(get_db),
-    _: TokenData = Depends(require_admin_or_partenaire),
 ):
+    """
+    Endpoint sans authentification pour visiteurs et clients.
+    - Les types de chambres entièrement réservés sont MASQUÉS.
+    - Seules les chambres réellement disponibles sont retournées.
+    """
     if date_fin <= date_debut:
         from fastapi import HTTPException
         raise HTTPException(status_code=422, detail="date_fin doit être après date_debut")
-    return await hotel_service.get_hotel_disponibilites(hotel_id, date_debut, date_fin, session)
+    return await hotel_service.get_hotel_disponibilites(
+        hotel_id, date_debut, date_fin, session, role="PUBLIC"
+    )
+
+
+@router.get(
+    "/{hotel_id}/disponibilites",
+    response_model=HotelDisponibilitesResponse,
+    summary="Disponibilités [ADMIN | PARTENAIRE]",
+)
+async def get_hotel_disponibilites(
+    hotel_id:     int,
+    date_debut:   date = Query(...),
+    date_fin:     date = Query(...),
+    session:      AsyncSession = Depends(get_db),
+    current_user: TokenData    = Depends(require_admin_or_partenaire),
+):
+    """
+    Endpoint authentifié pour admin et partenaires.
+    - Toutes les chambres sont retournées avec leur statut.
+    - Les occupées montrent les détails de réservation.
+    - Les types entièrement occupés sont visibles avec badge "Occupée".
+    """
+    if date_fin <= date_debut:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail="date_fin doit être après date_debut")
+    return await hotel_service.get_hotel_disponibilites(
+        hotel_id, date_debut, date_fin, session, role=current_user.role
+    )
 
 
 @router.get("/{hotel_id}/chambres/{chambre_id}/disponibilite",
@@ -454,7 +476,6 @@ async def create_avis(
     session:  AsyncSession = Depends(get_db),
     current_user: TokenData = Depends(require_client),
 ):
-    # ✅ ORDRE CORRECT : hotel_id, data, client_id, session
     return await hotel_service.create_avis(hotel_id, data, current_user.user_id, session)
 
 

@@ -3,7 +3,7 @@ ORM models pour :
   - Hotel
   - TypeChambre
   - TypeReservation
-  - Chambre
+  - Chambre         ← nb_chambres ajouté (stock total par type/hôtel)
   - Tarif
   - Avis
 """
@@ -58,10 +58,10 @@ class VilleVedette(Base):
     __tablename__ = "ville_vedette"
     __table_args__ = {"schema": "voyage_hotel"}
 
-    id:    Mapped[int]      = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    nom:   Mapped[str]      = mapped_column(String(100), nullable=False, unique=True)
-    ordre: Mapped[int]      = mapped_column(Integer, nullable=False, default=0, index=True)
-    actif: Mapped[bool]     = mapped_column(Boolean, nullable=False, default=True, index=True)
+    id:    Mapped[int]  = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    nom:   Mapped[str]  = mapped_column(String(100), nullable=False, unique=True)
+    ordre: Mapped[int]  = mapped_column(Integer, nullable=False, default=0, index=True)
+    actif: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     def __repr__(self) -> str:
@@ -99,14 +99,23 @@ class TypeReservation(Base):
 
 
 # ── Chambre ───────────────────────────────────────────────────────────────────
+# ⚠️  Une ligne = un TYPE de chambre dans un hôtel donné (pas une chambre physique)
+#     nb_chambres = stock total de ce type dans cet hôtel
+#     La contrainte unique (id_hotel, id_type_chambre) empêche les doublons
 class Chambre(Base):
     __tablename__ = "chambre"
+    __table_args__ = (
+        UniqueConstraint("id_hotel", "id_type_chambre", name="uq_chambre_hotel_type"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     capacite: Mapped[int] = mapped_column(Integer, nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     id_hotel: Mapped[int] = mapped_column(BigInteger, ForeignKey("hotel.id", ondelete="CASCADE"), nullable=False)
     id_type_chambre: Mapped[int] = mapped_column(BigInteger, ForeignKey("type_chambre.id", ondelete="RESTRICT"), nullable=False)
+    # ── NOUVEAU CHAMP ─────────────────────────────────────────────────────────
+    nb_chambres: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # ─────────────────────────────────────────────────────────────────────────
     actif: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -116,7 +125,7 @@ class Chambre(Base):
     tarifs: Mapped[list["Tarif"]] = relationship("Tarif", back_populates="chambre")
 
     def __repr__(self) -> str:
-        return f"<Chambre id={self.id} hotel={self.id_hotel}>"
+        return f"<Chambre id={self.id} hotel={self.id_hotel} type={self.id_type_chambre} nb={self.nb_chambres}>"
 
 
 # ── Tarif ─────────────────────────────────────────────────────────────────────
@@ -130,7 +139,6 @@ class Tarif(Base):
     id_chambre: Mapped[int] = mapped_column(BigInteger, ForeignKey("chambre.id", ondelete="CASCADE"), nullable=False)
     id_type_reservation: Mapped[int] = mapped_column(BigInteger, ForeignKey("type_reservation.id", ondelete="RESTRICT"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     chambre: Mapped[Chambre] = relationship("Chambre", back_populates="tarifs")
     type_reservation: Mapped[TypeReservation] = relationship("TypeReservation")
@@ -142,16 +150,15 @@ class Tarif(Base):
 # ── Avis ──────────────────────────────────────────────────────────────────────
 class Avis(Base):
     __tablename__ = "avis"
-
     __table_args__ = (
-        UniqueConstraint("id_client", "id_hotel", name="uq_avis_client_hotel"),
+        UniqueConstraint("id_hotel", "id_client", name="uq_avis_hotel_client"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     note: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     commentaire: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    id_client: Mapped[int] = mapped_column(BigInteger, ForeignKey("client.id", ondelete="CASCADE"), nullable=False)
+    id_client: Mapped[int] = mapped_column(BigInteger, ForeignKey("utilisateur.id", ondelete="CASCADE"), nullable=False)
     id_hotel: Mapped[int] = mapped_column(BigInteger, ForeignKey("hotel.id", ondelete="CASCADE"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 

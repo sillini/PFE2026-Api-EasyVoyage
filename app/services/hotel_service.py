@@ -1,13 +1,13 @@
 """
-app/services/hotel_service.py — VERSION FINALE CORRIGÉE
+app/services/hotel_service.py — VERSION STOCK
 
-CORRECTION AVIS :
-  Le modèle Avis n'a PAS de relation .client (seulement id_client FK → client.id).
-  On ne peut pas faire selectinload(Avis.client) → AttributeError.
-
-  SOLUTION : jointure manuelle sur Utilisateur pour charger prenom/nom,
-  puis construction de AvisResponse à la main avec AvisClientInfo.
+Logique de disponibilité par stock :
+  - Chambre.nb_chambres = nombre total de chambres de ce type dans cet hôtel
+  - nb_reservees = COUNT des réservations CONFIRMEES qui chevauchent la période
+  - nb_disponibles = nb_chambres - nb_reservees
+  - disponible = nb_disponibles > 0
 """
+from collections import defaultdict
 from datetime import date
 from typing import Optional
 
@@ -15,7 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.exceptions import ConflictException, ForbiddenException, NotFoundException
+from app.core.exceptions import ConflictException, NotFoundException
 from app.models.hotel import Avis, Chambre, Hotel, Tarif, TypeChambre, TypeReservation
 from app.models.utilisateur import Utilisateur
 from app.schemas.hotel import (
@@ -83,6 +83,7 @@ def _chambre_to_dict(chambre: Chambre, p_min, p_max) -> dict:
         "id_hotel":        chambre.id_hotel,
         "id_type_chambre": chambre.id_type_chambre,
         "type_chambre":    chambre.type_chambre,
+        "nb_chambres":     chambre.nb_chambres,
         "actif":           chambre.actif,
         "created_at":      chambre.created_at,
         "updated_at":      chambre.updated_at,
@@ -91,7 +92,6 @@ def _chambre_to_dict(chambre: Chambre, p_min, p_max) -> dict:
     }
 
 
-# ✅ Convertit un Avis + Utilisateur → AvisResponse avec client embarqué
 def _to_avis_response(avis: Avis, utilisateur: Optional[Utilisateur]) -> AvisResponse:
     client_info = None
     if utilisateur:
@@ -112,6 +112,28 @@ def _to_avis_response(avis: Avis, utilisateur: Optional[Utilisateur]) -> AvisRes
     )
 
 
+async def _count_reservations_periode(
+    chambre_id: int, date_debut, date_fin, session: AsyncSession
+) -> int:
+    """
+    Compte combien de réservations CONFIRMEES occupent cette chambre (type)
+    sur la période donnée. Chaque réservation = 1 chambre physique utilisée.
+    """
+    from app.models.reservation import Reservation, StatutReservation, LigneReservationChambre
+    result = await session.execute(
+        select(func.count())
+        .select_from(LigneReservationChambre)
+        .join(Reservation, Reservation.id == LigneReservationChambre.id_reservation)
+        .where(
+            LigneReservationChambre.id_chambre == chambre_id,
+            Reservation.statut == StatutReservation.CONFIRMEE,
+            Reservation.date_debut < date_fin,
+            Reservation.date_fin   > date_debut,
+        )
+    )
+    return result.scalar_one()
+
+
 # ═══════════════════════════════════════════════════════════
 #  HOTELS
 # ═══════════════════════════════════════════════════════════
@@ -130,23 +152,14 @@ async def list_hotels(
     page: int = 1,
     per_page: int = 10,
 ) -> HotelListResponse:
-
     query = select(Hotel).options(selectinload(Hotel.partenaire))
-
-    if actif_only:
-        query = query.where(Hotel.actif == True)
-    if id_partenaire is not None:
-        query = query.where(Hotel.id_partenaire == id_partenaire)
-    if ville:
-        query = query.where(Hotel.ville.ilike(f"%{ville}%"))
-    if etoiles_min is not None:
-        query = query.where(Hotel.etoiles >= etoiles_min)
-    if etoiles_max is not None:
-        query = query.where(Hotel.etoiles <= etoiles_max)
-    if note_min is not None:
-        query = query.where(Hotel.note_moyenne >= note_min)
-    if nom:
-        query = query.where(Hotel.nom.ilike(f"%{nom}%"))
+    if actif_only:         query = query.where(Hotel.actif == True)
+    if id_partenaire:      query = query.where(Hotel.id_partenaire == id_partenaire)
+    if ville:              query = query.where(Hotel.ville.ilike(f"%{ville}%"))
+    if etoiles_min:        query = query.where(Hotel.etoiles >= etoiles_min)
+    if etoiles_max:        query = query.where(Hotel.etoiles <= etoiles_max)
+    if note_min:           query = query.where(Hotel.note_moyenne >= note_min)
+    if nom:                query = query.where(Hotel.nom.ilike(f"%{nom}%"))
     if partenaire_nom or partenaire_email:
         query = query.join(Utilisateur, Utilisateur.id == Hotel.id_partenaire)
         if partenaire_nom:
@@ -158,11 +171,9 @@ async def list_hotels(
     total = (await session.execute(
         select(func.count()).select_from(query.subquery())
     )).scalar_one()
-
     query = query.order_by(Hotel.note_moyenne.desc(), Hotel.nom.asc())
     query = query.offset((page - 1) * per_page).limit(per_page)
     hotels = (await session.execute(query)).scalars().all()
-
     return HotelListResponse(
         total=total, page=page, per_page=per_page,
         items=[_to_hotel_response(h) for h in hotels],
@@ -171,18 +182,14 @@ async def list_hotels(
 
 async def get_hotel(hotel_id: int, session: AsyncSession) -> HotelResponse:
     hotel = (await session.execute(
-        select(Hotel)
-        .options(selectinload(Hotel.partenaire))
-        .where(Hotel.id == hotel_id)
+        select(Hotel).options(selectinload(Hotel.partenaire)).where(Hotel.id == hotel_id)
     )).scalar_one_or_none()
     if not hotel:
         raise NotFoundException(f"Hôtel {hotel_id} introuvable")
     return _to_hotel_response(hotel)
 
 
-async def create_hotel(
-    data: HotelCreate, session: AsyncSession, id_partenaire: Optional[int] = None
-) -> HotelResponse:
+async def create_hotel(data: HotelCreate, session: AsyncSession, id_partenaire: Optional[int] = None) -> HotelResponse:
     hotel = Hotel(**data.model_dump(), id_partenaire=id_partenaire)
     session.add(hotel)
     await session.flush()
@@ -222,9 +229,7 @@ async def admin_toggle_hotel(hotel_id: int, actif: bool, session: AsyncSession) 
 
 
 async def delete_hotel(hotel_id: int, session: AsyncSession) -> None:
-    hotel = (await session.execute(
-        select(Hotel).where(Hotel.id == hotel_id)
-    )).scalar_one_or_none()
+    hotel = (await session.execute(select(Hotel).where(Hotel.id == hotel_id))).scalar_one_or_none()
     if not hotel:
         raise NotFoundException(f"Hôtel {hotel_id} introuvable")
     hotel.actif = False
@@ -250,9 +255,7 @@ async def list_types_reservation(session: AsyncSession) -> list[TypeReservationR
 # ═══════════════════════════════════════════════════════════
 
 async def _check_hotel(hotel_id: int, session: AsyncSession) -> None:
-    if (await session.execute(
-        select(Hotel.id).where(Hotel.id == hotel_id)
-    )).scalar_one_or_none() is None:
+    if (await session.execute(select(Hotel.id).where(Hotel.id == hotel_id))).scalar_one_or_none() is None:
         raise NotFoundException(f"Hôtel {hotel_id} introuvable")
 
 
@@ -271,9 +274,9 @@ async def list_chambres(
         .options(selectinload(Chambre.type_chambre))
         .where(Chambre.id_hotel == hotel_id)
     )
-    if actif_only:    query = query.where(Chambre.actif == True)
-    if capacite_min:  query = query.where(Chambre.capacite >= capacite_min)
-    if capacite_max:  query = query.where(Chambre.capacite <= capacite_max)
+    if actif_only:      query = query.where(Chambre.actif == True)
+    if capacite_min:    query = query.where(Chambre.capacite >= capacite_min)
+    if capacite_max:    query = query.where(Chambre.capacite <= capacite_max)
     if id_type_chambre: query = query.where(Chambre.id_type_chambre == id_type_chambre)
 
     chambres = (await session.execute(query)).scalars().all()
@@ -300,12 +303,39 @@ async def get_chambre(hotel_id: int, chambre_id: int, session: AsyncSession) -> 
 
 async def create_chambre(hotel_id: int, data: ChambreCreate, session: AsyncSession) -> ChambreResponse:
     await _check_hotel(hotel_id, session)
-    ch = Chambre(**data.model_dump(), id_hotel=hotel_id)
-    session.add(ch)
-    await session.flush()
-    ch = (await session.execute(
-        select(Chambre).options(selectinload(Chambre.type_chambre)).where(Chambre.id == ch.id)
-    )).scalar_one()
+
+    # Vérifier si une chambre de ce type existe déjà pour cet hôtel
+    existing = (await session.execute(
+        select(Chambre).where(
+            Chambre.id_hotel == hotel_id,
+            Chambre.id_type_chambre == data.id_type_chambre,
+        )
+    )).scalar_one_or_none()
+
+    if existing:
+        # Mettre à jour le stock au lieu de créer un doublon
+        existing.nb_chambres += data.nb_chambres
+        existing.capacite     = data.capacite
+        if data.description:
+            existing.description = data.description
+        await session.flush()
+        ch = (await session.execute(
+            select(Chambre).options(selectinload(Chambre.type_chambre)).where(Chambre.id == existing.id)
+        )).scalar_one()
+    else:
+        ch = Chambre(
+            capacite=data.capacite,
+            description=data.description,
+            id_type_chambre=data.id_type_chambre,
+            nb_chambres=data.nb_chambres,
+            id_hotel=hotel_id,
+        )
+        session.add(ch)
+        await session.flush()
+        ch = (await session.execute(
+            select(Chambre).options(selectinload(Chambre.type_chambre)).where(Chambre.id == ch.id)
+        )).scalar_one()
+
     return ChambreResponse.model_validate(_chambre_to_dict(ch, None, None))
 
 
@@ -351,9 +381,7 @@ async def list_tarifs(hotel_id: int, chambre_id: int, session: AsyncSession) -> 
     return TarifListResponse(total=len(tarifs), items=[TarifResponse.model_validate(t) for t in tarifs])
 
 
-async def create_tarif(
-    hotel_id: int, chambre_id: int, data: TarifCreate, session: AsyncSession
-) -> TarifResponse:
+async def create_tarif(hotel_id: int, chambre_id: int, data: TarifCreate, session: AsyncSession) -> TarifResponse:
     if (await session.execute(
         select(Chambre.id).where(Chambre.id == chambre_id, Chambre.id_hotel == hotel_id)
     )).scalar_one_or_none() is None:
@@ -371,9 +399,7 @@ async def create_tarif(
     return TarifResponse.model_validate(tarif)
 
 
-async def update_tarif(
-    hotel_id: int, chambre_id: int, tarif_id: int, data, session: AsyncSession
-) -> TarifResponse:
+async def update_tarif(hotel_id: int, chambre_id: int, tarif_id: int, data, session: AsyncSession) -> TarifResponse:
     if (await session.execute(
         select(Chambre.id).where(Chambre.id == chambre_id, Chambre.id_hotel == hotel_id)
     )).scalar_one_or_none() is None:
@@ -392,9 +418,7 @@ async def update_tarif(
     return TarifResponse.model_validate(tarif)
 
 
-async def delete_tarif(
-    hotel_id: int, chambre_id: int, tarif_id: int, session: AsyncSession
-) -> None:
+async def delete_tarif(hotel_id: int, chambre_id: int, tarif_id: int, session: AsyncSession) -> None:
     if (await session.execute(
         select(Chambre.id).where(Chambre.id == chambre_id, Chambre.id_hotel == hotel_id)
     )).scalar_one_or_none() is None:
@@ -410,99 +434,75 @@ async def delete_tarif(
 
 # ═══════════════════════════════════════════════════════════
 #  AVIS
-#
-#  IMPORTANT : Avis.client n'existe PAS comme relation ORM.
-#  On charge Utilisateur manuellement via id_client.
 # ═══════════════════════════════════════════════════════════
 
 async def _get_utilisateur(client_id: int, session: AsyncSession) -> Optional[Utilisateur]:
-    """Charge l'Utilisateur depuis id_client (FK de Avis vers Client)."""
     return (await session.execute(
         select(Utilisateur).where(Utilisateur.id == client_id)
     )).scalar_one_or_none()
 
 
-async def list_avis(
-    hotel_id: int,
-    session: AsyncSession,
-    page: int = 1,
-    per_page: int = 20,
-) -> AvisListResponse:
+async def list_avis(hotel_id: int, session: AsyncSession, page: int = 1, per_page: int = 20) -> AvisListResponse:
     await _check_hotel(hotel_id, session)
-
     query = select(Avis).where(Avis.id_hotel == hotel_id)
-
-    total = (await session.execute(
-        select(func.count()).select_from(query.subquery())
-    )).scalar_one()
-
+    total = (await session.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
     avis_list = (await session.execute(
-        query.order_by(Avis.date.desc())
-        .offset((page - 1) * per_page)
-        .limit(per_page)
+        query.order_by(Avis.date.desc()).offset((page - 1) * per_page).limit(per_page)
     )).scalars().all()
-
     note_moy = round(sum(a.note for a in avis_list) / len(avis_list), 2) if avis_list else 0.0
-
-    # ✅ Charger les utilisateurs en une seule requête IN (efficace)
     client_ids = list({a.id_client for a in avis_list})
     utilisateurs = {}
     if client_ids:
-        rows = (await session.execute(
-            select(Utilisateur).where(Utilisateur.id.in_(client_ids))
-        )).scalars().all()
+        rows = (await session.execute(select(Utilisateur).where(Utilisateur.id.in_(client_ids)))).scalars().all()
         utilisateurs = {u.id: u for u in rows}
-
     items = [_to_avis_response(a, utilisateurs.get(a.id_client)) for a in avis_list]
-
-    return AvisListResponse(
-        total=total,
-        note_moyenne=note_moy,
-        items=items,
-    )
+    return AvisListResponse(total=total, note_moyenne=note_moy, items=items)
 
 
-async def create_avis(
-    hotel_id:  int,
-    data:      AvisCreate,
-    client_id: int,          # ✅ client_id AVANT session
-    session:   AsyncSession, # ✅ session EN DERNIER
-) -> AvisResponse:
+async def create_avis(hotel_id: int, data: AvisCreate, client_id: int, session: AsyncSession) -> AvisResponse:
     await _check_hotel(hotel_id, session)
-
-    # Un client ne peut laisser qu'un seul avis par hôtel
     existing = await session.execute(
         select(Avis.id).where(Avis.id_hotel == hotel_id, Avis.id_client == client_id)
     )
     if existing.scalar_one_or_none() is not None:
         raise ConflictException("Vous avez déjà laissé un avis pour cet hôtel")
-
-    avis = Avis(
-        id_hotel=hotel_id,
-        id_client=client_id,
-        note=data.note,
-        commentaire=data.commentaire,
-    )
+    avis = Avis(id_hotel=hotel_id, id_client=client_id, note=data.note, commentaire=data.commentaire)
     session.add(avis)
     await session.flush()
-
-    # ✅ Charger l'Utilisateur manuellement (pas de relation .client sur Avis)
     utilisateur = await _get_utilisateur(client_id, session)
     return _to_avis_response(avis, utilisateur)
 
 
 # ═══════════════════════════════════════════════════════════
-#  DISPONIBILITÉS
+#  DISPONIBILITÉS — LOGIQUE PAR STOCK
 # ═══════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════
+    #  REMPLACER la fonction get_hotel_disponibilites dans
+    #  app/services/hotel_service.py par cette version complète
+    #
+    #  CORRECTION : comptabilise les réservations des DEUX tables
+    #    - reservation (clients) via LigneReservationChambre
+    #    - reservation_visiteur (visiteurs sans compte)
+    # ═══════════════════════════════════════════════════════════
+
 async def get_hotel_disponibilites(
-    hotel_id: int, date_debut, date_fin, session: AsyncSession
+    hotel_id: int,
+    date_debut,
+    date_fin,
+    session: AsyncSession,
+    role: str = "ADMIN",   # "ADMIN" | "PARTENAIRE" | "PUBLIC"
 ):
-    from app.models.reservation import Reservation, StatutReservation, LigneReservationChambre
+    from app.models.reservation import (
+        Reservation, StatutReservation,
+        LigneReservationChambre, ReservationVisiteur,
+    )
     from app.schemas.hotel import (
         HotelDisponibilitesResponse, ChambreDisponibiliteResponse, OccupationPeriode,
     )
+
     await _check_hotel(hotel_id, session)
+
     chambres = (await session.execute(
         select(Chambre)
         .options(selectinload(Chambre.type_chambre))
@@ -512,46 +512,323 @@ async def get_hotel_disponibilites(
 
     chambres_dispo = []
     for ch in chambres:
-        reservations = (await session.execute(
-            select(Reservation)
-            .join(LigneReservationChambre,
-                  LigneReservationChambre.id_reservation == Reservation.id)
+
+        # ── 1. Réservations CLIENTS (table reservation + ligne_reservation_chambre) ──
+        nb_clients = (await session.execute(
+            select(func.count())
+            .select_from(LigneReservationChambre)
+            .join(Reservation, Reservation.id == LigneReservationChambre.id_reservation)
             .where(
                 LigneReservationChambre.id_chambre == ch.id,
                 Reservation.statut == StatutReservation.CONFIRMEE,
                 Reservation.date_debut < date_fin,
                 Reservation.date_fin   > date_debut,
             )
-            .order_by(Reservation.date_debut.asc())
-        )).scalars().all()
+        )).scalar_one()
 
+        # ── 2. Réservations VISITEURS (table reservation_visiteur) ──────────────────
+        nb_visiteurs = (await session.execute(
+            select(func.count())
+            .select_from(ReservationVisiteur)
+            .where(
+                ReservationVisiteur.id_chambre == ch.id,
+                ReservationVisiteur.statut == "CONFIRMEE",
+                ReservationVisiteur.date_debut < date_fin,
+                ReservationVisiteur.date_fin   > date_debut,
+            )
+        )).scalar_one()
+
+        # ── 3. Total réservées = clients + visiteurs ─────────────────────────────────
+        nb_reservees   = nb_clients + nb_visiteurs
+        nb_total       = ch.nb_chambres
+        nb_disponibles = max(0, nb_total - nb_reservees)
+        is_available   = nb_disponibles > 0
+
+        # ── 4. Charger les occupations pour admin/partenaire ─────────────────────────
+        occupations = []
+        if role in ("ADMIN", "PARTENAIRE"):
+            # Occupations clients
+            resas_clients = (await session.execute(
+                select(Reservation)
+                .join(LigneReservationChambre, LigneReservationChambre.id_reservation == Reservation.id)
+                .where(
+                    LigneReservationChambre.id_chambre == ch.id,
+                    Reservation.statut == StatutReservation.CONFIRMEE,
+                    Reservation.date_debut < date_fin,
+                    Reservation.date_fin   > date_debut,
+                )
+                .order_by(Reservation.date_debut.asc())
+            )).scalars().all()
+
+            # Occupations visiteurs
+            resas_visiteurs = (await session.execute(
+                select(ReservationVisiteur)
+                .where(
+                    ReservationVisiteur.id_chambre == ch.id,
+                    ReservationVisiteur.statut == "CONFIRMEE",
+                    ReservationVisiteur.date_debut < date_fin,
+                    ReservationVisiteur.date_fin   > date_debut,
+                )
+                .order_by(ReservationVisiteur.date_debut.asc())
+            )).scalars().all()
+
+            occupations = [
+                OccupationPeriode(
+                    date_debut=r.date_debut,
+                    date_fin=r.date_fin,
+                    id_reservation=r.id,
+                )
+                for r in resas_clients
+            ] + [
+                OccupationPeriode(
+                    date_debut=r.date_debut,
+                    date_fin=r.date_fin,
+                    id_reservation=r.id,
+                )
+                for r in resas_visiteurs
+            ]
+            # Trier par date de début
+            occupations.sort(key=lambda o: o.date_debut)
+
+        # ── 5. Tarif courant ──────────────────────────────────────────────────────────
         tarif = (await session.execute(
             select(Tarif)
-            .where(Tarif.id_chambre == ch.id, Tarif.date_debut <= date_debut, Tarif.date_fin >= date_fin)
+            .where(
+                Tarif.id_chambre == ch.id,
+                Tarif.date_debut <= date_debut,
+                Tarif.date_fin   >= date_fin,
+            )
             .order_by(Tarif.prix.asc()).limit(1)
         )).scalar_one_or_none()
 
         p = float(tarif.prix) if tarif else None
+
         chambres_dispo.append(ChambreDisponibiliteResponse(
             chambre_id=ch.id,
-            disponible=len(reservations) == 0,
-            occupations=[OccupationPeriode(date_debut=r.date_debut, date_fin=r.date_fin) for r in reservations],
-            prix_min=p, prix_max=p,
+            disponible=is_available,
+            nb_total=nb_total,
+            nb_reservees=nb_reservees,
+            nb_disponibles=nb_disponibles,
+            occupations=occupations,
+            prix_min=p,
+            prix_max=p,
+            type_chambre={
+                "id":  ch.type_chambre.id,
+                "nom": ch.type_chambre.nom,
+            } if ch.type_chambre else None,
+            capacite=ch.capacite,
+            description=ch.description,
         ))
 
+    # ── Filtrage PUBLIC : masquer les types dont nb_disponibles == 0 ─────────────
+    if role == "PUBLIC":
+        chambres_dispo = [c for c in chambres_dispo if c.disponible]
+
     return HotelDisponibilitesResponse(
-        hotel_id=hotel_id, date_debut=date_debut, date_fin=date_fin, chambres=chambres_dispo,
+        hotel_id=hotel_id,
+        date_debut=date_debut,
+        date_fin=date_fin,
+        chambres=chambres_dispo,
     )
 
 
+# ═══════════════════════════════════════════════════════════
+#  REMPLACER AUSSI get_chambre_disponibilite par cette version
+# ═══════════════════════════════════════════════════════════
+
+async def get_hotel_disponibilites(
+    hotel_id: int,
+    date_debut,
+    date_fin,
+    session: AsyncSession,
+    role: str = "ADMIN",
+):
+    from app.models.reservation import (
+        Reservation, StatutReservation,
+        LigneReservationChambre, ReservationVisiteur,
+    )
+    from app.schemas.hotel import (
+        HotelDisponibilitesResponse, ChambreDisponibiliteResponse, OccupationPeriode,
+    )
+ 
+    await _check_hotel(hotel_id, session)
+ 
+    chambres = (await session.execute(
+        select(Chambre)
+        .options(selectinload(Chambre.type_chambre))
+        .where(Chambre.id_hotel == hotel_id, Chambre.actif == True)
+        .order_by(Chambre.id.asc())
+    )).scalars().all()
+ 
+    chambres_dispo = []
+    for ch in chambres:
+ 
+        # ── Compter clients (via ligne_reservation_chambre) ──────────────────
+        nb_clients = (await session.execute(
+            select(func.count())
+            .select_from(LigneReservationChambre)
+            .join(Reservation, Reservation.id == LigneReservationChambre.id_reservation)
+            .where(
+                LigneReservationChambre.id_chambre == ch.id,
+                Reservation.statut == StatutReservation.CONFIRMEE,
+                Reservation.date_debut < date_fin,
+                Reservation.date_fin   > date_debut,
+            )
+        )).scalar_one()
+ 
+        # ── Compter visiteurs (table reservation_visiteur) ───────────────────
+        nb_visiteurs = (await session.execute(
+            select(func.count())
+            .select_from(ReservationVisiteur)
+            .where(
+                ReservationVisiteur.id_chambre == ch.id,
+                ReservationVisiteur.statut == "CONFIRMEE",
+                ReservationVisiteur.date_debut < date_fin,
+                ReservationVisiteur.date_fin   > date_debut,
+            )
+        )).scalar_one()
+ 
+        nb_reservees   = nb_clients + nb_visiteurs
+        nb_total       = ch.nb_chambres
+        nb_disponibles = max(0, nb_total - nb_reservees)
+        is_available   = nb_disponibles > 0
+ 
+        # ── Occupations (admin/partenaire uniquement) ────────────────────────
+        occupations = []
+        if role in ("ADMIN", "PARTENAIRE"):
+ 
+            # Clients avec leur facture → affiche N° facture
+            resas_clients = (await session.execute(
+                select(Reservation)
+                .options(selectinload(Reservation.facture))
+                .join(LigneReservationChambre, LigneReservationChambre.id_reservation == Reservation.id)
+                .where(
+                    LigneReservationChambre.id_chambre == ch.id,
+                    Reservation.statut == StatutReservation.CONFIRMEE,
+                    Reservation.date_debut < date_fin,
+                    Reservation.date_fin   > date_debut,
+                )
+                .order_by(Reservation.date_debut.asc())
+            )).scalars().all()
+ 
+            for r in resas_clients:
+                numero = r.facture.numero if r.facture else f"#{r.id}"
+                occupations.append(OccupationPeriode(
+                    date_debut=r.date_debut,
+                    date_fin=r.date_fin,
+                    id_reservation=r.id,
+                    numero_ref=numero,
+                    source="client",
+                ))
+ 
+            # Visiteurs → affiche N° voucher
+            resas_visiteurs = (await session.execute(
+                select(ReservationVisiteur)
+                .where(
+                    ReservationVisiteur.id_chambre == ch.id,
+                    ReservationVisiteur.statut == "CONFIRMEE",
+                    ReservationVisiteur.date_debut < date_fin,
+                    ReservationVisiteur.date_fin   > date_debut,
+                )
+                .order_by(ReservationVisiteur.date_debut.asc())
+            )).scalars().all()
+ 
+            for r in resas_visiteurs:
+                occupations.append(OccupationPeriode(
+                    date_debut=r.date_debut,
+                    date_fin=r.date_fin,
+                    id_reservation=r.id,
+                    numero_ref=r.numero_voucher,
+                    source="visiteur",
+                ))
+ 
+            # Trier par date de début
+            occupations.sort(key=lambda o: o.date_debut)
+ 
+        # ── Tarif courant ────────────────────────────────────────────────────
+        tarif = (await session.execute(
+            select(Tarif)
+            .where(
+                Tarif.id_chambre == ch.id,
+                Tarif.date_debut <= date_debut,
+                Tarif.date_fin   >= date_fin,
+            )
+            .order_by(Tarif.prix.asc()).limit(1)
+        )).scalar_one_or_none()
+        p = float(tarif.prix) if tarif else None
+ 
+        chambres_dispo.append(ChambreDisponibiliteResponse(
+            chambre_id=ch.id,
+            disponible=is_available,
+            nb_total=nb_total,
+            nb_reservees=nb_reservees,
+            nb_disponibles=nb_disponibles,
+            occupations=occupations,
+            prix_min=p, prix_max=p,
+            type_chambre={"id": ch.type_chambre.id, "nom": ch.type_chambre.nom} if ch.type_chambre else None,
+            capacite=ch.capacite,
+            description=ch.description,
+        ))
+ 
+    # Filtrage PUBLIC : masquer les types dont nb_disponibles == 0
+    if role == "PUBLIC":
+        chambres_dispo = [c for c in chambres_dispo if c.disponible]
+ 
+    return HotelDisponibilitesResponse(
+        hotel_id=hotel_id,
+        date_debut=date_debut,
+        date_fin=date_fin,
+        chambres=chambres_dispo,
+    )
+ 
+ 
 async def get_chambre_disponibilite(
     hotel_id: int, chambre_id: int, date_debut, date_fin, session: AsyncSession
 ):
-    from app.models.reservation import Reservation, StatutReservation, LigneReservationChambre
+    from app.models.reservation import (
+        Reservation, StatutReservation,
+        LigneReservationChambre, ReservationVisiteur,
+    )
     from app.schemas.hotel import ChambreDisponibiliteResponse, OccupationPeriode
-    await get_chambre(hotel_id, chambre_id, session)
-    reservations = (await session.execute(
+ 
+    ch = (await session.execute(
+        select(Chambre)
+        .options(selectinload(Chambre.type_chambre))
+        .where(Chambre.id == chambre_id, Chambre.id_hotel == hotel_id)
+    )).scalar_one_or_none()
+    if not ch:
+        raise NotFoundException(f"Chambre {chambre_id} introuvable")
+ 
+    nb_clients = (await session.execute(
+        select(func.count())
+        .select_from(LigneReservationChambre)
+        .join(Reservation, Reservation.id == LigneReservationChambre.id_reservation)
+        .where(
+            LigneReservationChambre.id_chambre == chambre_id,
+            Reservation.statut == StatutReservation.CONFIRMEE,
+            Reservation.date_debut < date_fin,
+            Reservation.date_fin   > date_debut,
+        )
+    )).scalar_one()
+ 
+    nb_visiteurs = (await session.execute(
+        select(func.count())
+        .select_from(ReservationVisiteur)
+        .where(
+            ReservationVisiteur.id_chambre == chambre_id,
+            ReservationVisiteur.statut == "CONFIRMEE",
+            ReservationVisiteur.date_debut < date_fin,
+            ReservationVisiteur.date_fin   > date_debut,
+        )
+    )).scalar_one()
+ 
+    nb_reservees   = nb_clients + nb_visiteurs
+    nb_total       = ch.nb_chambres
+    nb_disponibles = max(0, nb_total - nb_reservees)
+ 
+    resas_c = (await session.execute(
         select(Reservation)
+        .options(selectinload(Reservation.facture))
         .join(LigneReservationChambre, LigneReservationChambre.id_reservation == Reservation.id)
         .where(
             LigneReservationChambre.id_chambre == chambre_id,
@@ -560,14 +837,40 @@ async def get_chambre_disponibilite(
             Reservation.date_fin   > date_debut,
         )
     )).scalars().all()
+ 
+    resas_v = (await session.execute(
+        select(ReservationVisiteur)
+        .where(
+            ReservationVisiteur.id_chambre == chambre_id,
+            ReservationVisiteur.statut == "CONFIRMEE",
+            ReservationVisiteur.date_debut < date_fin,
+            ReservationVisiteur.date_fin   > date_debut,
+        )
+    )).scalars().all()
+ 
+    occupations = sorted(
+        [OccupationPeriode(
+            date_debut=r.date_debut, date_fin=r.date_fin, id_reservation=r.id,
+            numero_ref=r.facture.numero if r.facture else f"#{r.id}",
+            source="client",
+        ) for r in resas_c] +
+        [OccupationPeriode(
+            date_debut=r.date_debut, date_fin=r.date_fin, id_reservation=r.id,
+            numero_ref=r.numero_voucher,
+            source="visiteur",
+        ) for r in resas_v],
+        key=lambda o: o.date_debut,
+    )
+ 
     return ChambreDisponibiliteResponse(
         chambre_id=chambre_id,
-        disponible=len(reservations) == 0,
-        occupations=[OccupationPeriode(date_debut=r.date_debut, date_fin=r.date_fin) for r in reservations],
+        disponible=nb_disponibles > 0,
+        nb_total=nb_total,
+        nb_reservees=nb_reservees,
+        nb_disponibles=nb_disponibles,
+        occupations=occupations,
         prix_min=None, prix_max=None,
     )
-
-
 # ═══════════════════════════════════════════════════════════
 #  MIS EN AVANT + VILLES VEDETTES
 # ═══════════════════════════════════════════════════════════
