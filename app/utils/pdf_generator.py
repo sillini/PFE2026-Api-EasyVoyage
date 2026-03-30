@@ -73,6 +73,12 @@ def _get_styles():
         textColor=colors.black,
     ))
     styles.add(ParagraphStyle(
+        name="CellText",
+        fontSize=9, fontName="Helvetica",
+        textColor=colors.black,
+        leading=12,
+    ))
+    styles.add(ParagraphStyle(
         name="PiedPage",
         fontSize=7.5, fontName="Helvetica",
         textColor=GRIS_TEXTE, alignment=1,  # centré
@@ -202,25 +208,34 @@ def generer_facture_pdf(
     # Header du tableau
     presta_header = [["Prestation", "Description", "Qté", "P.U. (TND)", "Total (TND)"]]
     presta_rows = []
-    sous_total = 0.0
+    sous_total_ht_prestations = 0.0
 
     for p in prestations:
         if p["type"] == "voyage":
-            desc = f"{p['titre']}\nDestination : {p['destination']}"
+            # Pour un voyage, le prix affiché est HT
+            prix_ht = p["prix"] / 1.19
+            desc_para = Paragraph(
+                f"{p['titre']}<br/><font size='8' color='#777777'>Destination : {p['destination']}</font>",
+                styles["CellText"]
+            )
             qte = "1"
-            pu = f"{p['prix']:.3f}"
-            total_ligne = p['prix']
-            presta_rows.append(["Voyage", desc, qte, pu, f"{total_ligne:.3f}"])
+            pu = f"{prix_ht:.3f}"
+            total_ligne = prix_ht
+            presta_rows.append(["Voyage", desc_para, qte, pu, f"{total_ligne:.3f}"])
         else:
-            desc = p.get("description") or "Chambre standard"
-            qte = str(p.get("quantite", 1))
-            pu = f"{p['prix_unitaire']:.3f}"
-            total_ligne = p['prix_unitaire'] * p.get("quantite", 1)
-            presta_rows.append(["Hébergement", desc, qte, pu, f"{total_ligne:.3f}"])
-        sous_total += total_ligne
+            # Pour une chambre, prix_unitaire est déjà HT
+            prix_ht_nuit = p.get("prix_unitaire", 0)
+            quantite = p.get("quantite", 1)
+            desc_text = p.get("description") or "Hébergement"
+            desc_para = Paragraph(desc_text, styles["CellText"])
+            qte = str(quantite)
+            pu = f"{prix_ht_nuit:.3f}"
+            total_ligne = prix_ht_nuit * quantite
+            presta_rows.append(["Hébergement", desc_para, qte, pu, f"{total_ligne:.3f}"])
+        sous_total_ht_prestations += total_ligne
 
     presta_data = presta_header + presta_rows
-    col_widths = [largeur * 0.15, largeur * 0.42, largeur * 0.08,
+    col_widths = [largeur * 0.14, largeur * 0.44, largeur * 0.07,
                   largeur * 0.17, largeur * 0.18]
 
     presta_table = Table(presta_data, colWidths=col_widths)
@@ -236,10 +251,12 @@ def generer_facture_pdf(
         ("FONTSIZE",     (0, 1), (-1, -1), 9),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, GRIS_LEGER]),
         ("ALIGN",        (2, 1), (-1, -1), "RIGHT"),
+        ("ALIGN",        (0, 1), (0, -1), "LEFT"),
         ("VALIGN",       (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING",   (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+        ("TOPPADDING",   (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 7),
         ("LEFTPADDING",  (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
         ("GRID",         (0, 0), (-1, -1), 0.3, colors.HexColor("#DDDDDD")),
     ]))
     elements.append(presta_table)
@@ -247,10 +264,15 @@ def generer_facture_pdf(
 
     # ══════════════════════════════════════════════════════
     #  RÉCAPITULATIF MONTANTS
+    #  CORRECTION : total_ttc inclut déjà la TVA 19%
+    #  → sous_total_ht = total_ttc / 1.19
     # ══════════════════════════════════════════════════════
+    sous_total_ht = total_ttc / 1.19
+    montant_tva   = total_ttc - sous_total_ht
+
     recap_data = [
-        ["", "Sous-total HT", f"{total_ttc:.3f} TND"],
-        ["", "TVA (19%)",     f"{total_ttc * 0.19:.3f} TND"],
+        ["", "Sous-total HT", f"{sous_total_ht:.3f} TND"],
+        ["", "TVA (19%)",     f"{montant_tva:.3f} TND"],
         ["", "TOTAL TTC",     f"{total_ttc:.3f} TND"],
     ]
 

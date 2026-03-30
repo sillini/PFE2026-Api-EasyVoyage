@@ -43,18 +43,27 @@ class LigneChambreResponse(BaseModel):
 
 # ═══════════════════════════════════════════════════════════
 #  RESERVATION CREATE — VOYAGE
+#  nb_adultes + nb_enfants obligatoires pour :
+#    - calculer total_ttc = prix_base × (nb_adultes + nb_enfants)
+#    - incrémenter/décrémenter nb_inscrits du voyage
 # ═══════════════════════════════════════════════════════════
 class ReservationVoyageCreate(BaseModel):
     """Réservation d'un voyage — id_voyage obligatoire."""
     date_debut: date = Field(..., examples=["2026-06-01"])
-    date_fin: date = Field(..., examples=["2026-06-08"])
-    id_voyage: int = Field(..., examples=[1], description="ID du voyage à réserver")
+    date_fin:   date = Field(..., examples=["2026-06-08"])
+    id_voyage:  int  = Field(..., examples=[1], description="ID du voyage à réserver")
+    nb_adultes: int  = Field(default=1, ge=1, examples=[2], description="Nombre d'adultes (min 1)")
+    nb_enfants: int  = Field(default=0, ge=0, examples=[0], description="Nombre d'enfants")
 
     @model_validator(mode="after")
     def dates_valides(self) -> "ReservationVoyageCreate":
         if self.date_fin <= self.date_debut:
             raise ValueError("date_fin doit être après date_debut")
         return self
+
+    @property
+    def nb_personnes(self) -> int:
+        return self.nb_adultes + self.nb_enfants
 
 
 # ═══════════════════════════════════════════════════════════
@@ -63,7 +72,7 @@ class ReservationVoyageCreate(BaseModel):
 class ReservationChambresCreate(BaseModel):
     """Réservation de chambres d'hôtel — liste de chambres obligatoire."""
     date_debut: date = Field(..., examples=["2026-06-01"])
-    date_fin: date = Field(..., examples=["2026-06-08"])
+    date_fin:   date = Field(..., examples=["2026-06-08"])
     chambres: List[LigneChambreCreate] = Field(
         ...,
         min_length=1,
@@ -75,7 +84,6 @@ class ReservationChambresCreate(BaseModel):
     def valider(self) -> "ReservationChambresCreate":
         if self.date_fin <= self.date_debut:
             raise ValueError("date_fin doit être après date_debut")
-        # Vérifier unicité des chambres (PK composée dans la DB)
         ids = [c.id_chambre for c in self.chambres]
         if len(ids) != len(set(ids)):
             raise ValueError(
@@ -96,6 +104,8 @@ class ReservationResponse(BaseModel):
     total_ttc: float
     id_client: int
     id_voyage: Optional[int] = None
+    nb_adultes: int = 0   # ← nb voyageurs adultes (voyage uniquement)
+    nb_enfants: int = 0   # ← nb voyageurs enfants (voyage uniquement)
     lignes_chambres: List[LigneChambreResponse] = []
     numero_facture: Optional[str] = None
     statut_facture: Optional[str] = None
@@ -148,6 +158,6 @@ class FactureResponse(BaseModel):
     montant_total: float
     statut: str
     fichier_pdf: Optional[str]
-    id_reservation: int
+    id_reservation: Optional[int] = None   # nullable (factures visiteurs)
     paiements: List[PaiementResponse] = []
     model_config = {"from_attributes": True}

@@ -471,7 +471,31 @@ async def create_avis(hotel_id: int, data: AvisCreate, client_id: int, session: 
     await session.flush()
     utilisateur = await _get_utilisateur(client_id, session)
     return _to_avis_response(avis, utilisateur)
+async def delete_avis(
+    hotel_id: int,
+    avis_id: int,
+    client_id: int,
+    role: str,
+    session: AsyncSession,
+) -> None:
+    """
+    Supprime un avis.
+    - ADMIN  : peut supprimer n'importe quel avis de cet hôtel
+    - CLIENT : peut supprimer uniquement son propre avis
+    """
+    avis = (await session.execute(
+        select(Avis).where(Avis.id == avis_id, Avis.id_hotel == hotel_id)
+    )).scalar_one_or_none()
 
+    if not avis:
+        raise NotFoundException(f"Avis {avis_id} introuvable pour l'hôtel {hotel_id}")
+
+    if role != "ADMIN" and avis.id_client != client_id:
+        from app.core.exceptions import ForbiddenException
+        raise ForbiddenException("Vous ne pouvez supprimer que vos propres avis")
+
+    await session.delete(avis)
+    await session.flush()
 
 # ═══════════════════════════════════════════════════════════
 #  DISPONIBILITÉS — LOGIQUE PAR STOCK
@@ -631,17 +655,20 @@ async def get_hotel_disponibilites(
         chambres=chambres_dispo,
     )
 
-
 # ═══════════════════════════════════════════════════════════
-#  REMPLACER AUSSI get_chambre_disponibilite par cette version
+#  REMPLACER dans app/services/hotel_service.py
+#  la fonction get_hotel_disponibilites
+#  SEUL CHANGEMENT : ajout du paramètre capacite_min
+#  et filtre sur ch.capacite >= capacite_min
 # ═══════════════════════════════════════════════════════════
 
 async def get_hotel_disponibilites(
-    hotel_id: int,
+    hotel_id:     int,
     date_debut,
     date_fin,
-    session: AsyncSession,
-    role: str = "ADMIN",
+    session:      AsyncSession,
+    role:         str          = "ADMIN",   # "ADMIN" | "PARTENAIRE" | "PUBLIC"
+    capacite_min: Optional[int] = None,     # ← NOUVEAU : filtre capacité
 ):
     from app.models.reservation import (
         Reservation, StatutReservation,
@@ -650,20 +677,25 @@ async def get_hotel_disponibilites(
     from app.schemas.hotel import (
         HotelDisponibilitesResponse, ChambreDisponibiliteResponse, OccupationPeriode,
     )
- 
+
     await _check_hotel(hotel_id, session)
- 
-    chambres = (await session.execute(
+
+    # ── Requête chambres avec filtre capacite_min optionnel ──────────────────
+    q = (
         select(Chambre)
         .options(selectinload(Chambre.type_chambre))
         .where(Chambre.id_hotel == hotel_id, Chambre.actif == True)
-        .order_by(Chambre.id.asc())
-    )).scalars().all()
- 
+    )
+    if capacite_min is not None:
+        q = q.where(Chambre.capacite >= capacite_min)   # ← filtre capacité
+    q = q.order_by(Chambre.id.asc())
+
+    chambres = (await session.execute(q)).scalars().all()
+
     chambres_dispo = []
     for ch in chambres:
- 
-        # ── Compter clients (via ligne_reservation_chambre) ──────────────────
+
+        # ── 1. Réservations CLIENTS (table reservation + ligne_reservation_chambre) ──
         nb_clients = (await session.execute(
             select(func.count())
             .select_from(LigneReservationChambre)
@@ -675,8 +707,8 @@ async def get_hotel_disponibilites(
                 Reservation.date_fin   > date_debut,
             )
         )).scalar_one()
- 
-        # ── Compter visiteurs (table reservation_visiteur) ───────────────────
+
+        # ── 2. Réservations VISITEURS (table reservation_visiteur) ──────────────────
         nb_visiteurs = (await session.execute(
             select(func.count())
             .select_from(ReservationVisiteur)
@@ -687,18 +719,17 @@ async def get_hotel_disponibilites(
                 ReservationVisiteur.date_fin   > date_debut,
             )
         )).scalar_one()
- 
+
+        # ── 3. Calcul stock ──────────────────────────────────────────────────────────
         nb_reservees   = nb_clients + nb_visiteurs
         nb_total       = ch.nb_chambres
         nb_disponibles = max(0, nb_total - nb_reservees)
         is_available   = nb_disponibles > 0
- 
-        # ── Occupations (admin/partenaire uniquement) ────────────────────────
+
+        # ── 4. Occupations détaillées (admin/partenaire seulement) ───────────────────
         occupations = []
         if role in ("ADMIN", "PARTENAIRE"):
- 
-            # Clients avec leur facture → affiche N° facture
-            resas_clients = (await session.execute(
+            resas_c = (await session.execute(
                 select(Reservation)
                 .options(selectinload(Reservation.facture))
                 .join(LigneReservationChambre, LigneReservationChambre.id_reservation == Reservation.id)
@@ -708,21 +739,17 @@ async def get_hotel_disponibilites(
                     Reservation.date_debut < date_fin,
                     Reservation.date_fin   > date_debut,
                 )
-                .order_by(Reservation.date_debut.asc())
             )).scalars().all()
- 
-            for r in resas_clients:
-                numero = r.facture.numero if r.facture else f"#{r.id}"
+            for r in resas_c:
                 occupations.append(OccupationPeriode(
                     date_debut=r.date_debut,
                     date_fin=r.date_fin,
-                    id_reservation=r.id,
-                    numero_ref=numero,
+                    nb_reservees=1,
                     source="client",
+                    reservation_id=r.id,
                 ))
- 
-            # Visiteurs → affiche N° voucher
-            resas_visiteurs = (await session.execute(
+
+            resas_v = (await session.execute(
                 select(ReservationVisiteur)
                 .where(
                     ReservationVisiteur.id_chambre == ch.id,
@@ -730,22 +757,17 @@ async def get_hotel_disponibilites(
                     ReservationVisiteur.date_debut < date_fin,
                     ReservationVisiteur.date_fin   > date_debut,
                 )
-                .order_by(ReservationVisiteur.date_debut.asc())
             )).scalars().all()
- 
-            for r in resas_visiteurs:
+            for v in resas_v:
                 occupations.append(OccupationPeriode(
-                    date_debut=r.date_debut,
-                    date_fin=r.date_fin,
-                    id_reservation=r.id,
-                    numero_ref=r.numero_voucher,
+                    date_debut=v.date_debut,
+                    date_fin=v.date_fin,
+                    nb_reservees=1,
                     source="visiteur",
+                    reservation_id=v.id,
                 ))
- 
-            # Trier par date de début
-            occupations.sort(key=lambda o: o.date_debut)
- 
-        # ── Tarif courant ────────────────────────────────────────────────────
+
+        # ── 5. Tarif courant ─────────────────────────────────────────────────────────
         tarif = (await session.execute(
             select(Tarif)
             .where(
@@ -755,8 +777,9 @@ async def get_hotel_disponibilites(
             )
             .order_by(Tarif.prix.asc()).limit(1)
         )).scalar_one_or_none()
+
         p = float(tarif.prix) if tarif else None
- 
+
         chambres_dispo.append(ChambreDisponibiliteResponse(
             chambre_id=ch.id,
             disponible=is_available,
@@ -764,16 +787,20 @@ async def get_hotel_disponibilites(
             nb_reservees=nb_reservees,
             nb_disponibles=nb_disponibles,
             occupations=occupations,
-            prix_min=p, prix_max=p,
-            type_chambre={"id": ch.type_chambre.id, "nom": ch.type_chambre.nom} if ch.type_chambre else None,
+            prix_min=p,
+            prix_max=p,
+            type_chambre={
+                "id":  ch.type_chambre.id,
+                "nom": ch.type_chambre.nom,
+            } if ch.type_chambre else None,
             capacite=ch.capacite,
             description=ch.description,
         ))
- 
-    # Filtrage PUBLIC : masquer les types dont nb_disponibles == 0
+
+    # ── Filtrage PUBLIC : masquer les types dont nb_disponibles == 0 ─────────────
     if role == "PUBLIC":
         chambres_dispo = [c for c in chambres_dispo if c.disponible]
- 
+
     return HotelDisponibilitesResponse(
         hotel_id=hotel_id,
         date_debut=date_debut,

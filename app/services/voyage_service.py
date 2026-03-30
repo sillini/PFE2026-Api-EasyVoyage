@@ -33,21 +33,27 @@ def _to_response(voyage: Voyage) -> VoyageResponse:
             prenom=voyage.admin.prenom,
             email=voyage.admin.email,
         )
+
+    nb_inscrits      = voyage.nb_inscrits or 0
+    places_restantes = max(0, voyage.capacite_max - nb_inscrits)
+
     data = {
-        "id": voyage.id,
-        "titre": voyage.titre,
-        "description": voyage.description,
-        "destination": voyage.destination,
-        "duree": voyage.duree,
-        "prix_base": float(voyage.prix_base),
-        "date_depart": voyage.date_depart,
-        "date_retour": voyage.date_retour,
-        "capacite_max": voyage.capacite_max,
-        "actif": voyage.actif,
-        "id_admin": voyage.id_admin,
-        "admin": admin_info,
-        "created_at": voyage.created_at,
-        "updated_at": voyage.updated_at,
+        "id":               voyage.id,
+        "titre":            voyage.titre,
+        "description":      voyage.description,
+        "destination":      voyage.destination,
+        "duree":            voyage.duree,
+        "prix_base":        float(voyage.prix_base),
+        "date_depart":      voyage.date_depart,
+        "date_retour":      voyage.date_retour,
+        "capacite_max":     voyage.capacite_max,
+        "nb_inscrits":      nb_inscrits,
+        "places_restantes": places_restantes,
+        "actif":            voyage.actif,
+        "id_admin":         voyage.id_admin,
+        "admin":            admin_info,
+        "created_at":       voyage.created_at,
+        "updated_at":       voyage.updated_at,
     }
     return VoyageResponse.model_validate(data)
 
@@ -68,64 +74,51 @@ async def list_voyages(
     per_page: int = 10,
 ) -> VoyageListResponse:
 
-    # Jointure avec utilisateur pour filtres admin
     query = select(Voyage).options(selectinload(Voyage.admin))
 
-    # Filtre actif (idx_voyage_actif)
     if actif_only:
         query = query.where(Voyage.actif == True)
 
-    # Filtre destination (idx_voyage_destination + unaccent)
     if destination:
         query = query.where(
             func.unaccent(Voyage.destination).ilike(f"%{destination}%")
         )
 
-    # Filtres prix
     if prix_min is not None:
         query = query.where(Voyage.prix_base >= prix_min)
     if prix_max is not None:
         query = query.where(Voyage.prix_base <= prix_max)
 
-    # Filtres durée
     if duree_min is not None:
         query = query.where(Voyage.duree >= duree_min)
     if duree_max is not None:
         query = query.where(Voyage.duree <= duree_max)
 
-    # Filtres date départ (idx_voyage_date_depart)
     if date_depart_min:
         query = query.where(Voyage.date_depart >= date_depart_min)
     if date_depart_max:
         query = query.where(Voyage.date_depart <= date_depart_max)
 
-    # Filtres admin (jointure Utilisateur)
     if admin_nom or admin_email:
         query = query.join(Utilisateur, Utilisateur.id == Voyage.id_admin)
         if admin_nom:
-            # Recherche dans nom + prenom (idx_utilisateur_nom)
             search = f"%{admin_nom}%"
             query = query.where(
                 func.unaccent(Utilisateur.nom).ilike(search)
                 | func.unaccent(Utilisateur.prenom).ilike(search)
             )
         if admin_email:
-            # Recherche par email (idx_utilisateur_email)
-            query = query.where(
-                Utilisateur.email.ilike(f"%{admin_email}%")
-            )
+            query = query.where(Utilisateur.email.ilike(f"%{admin_email}%"))
 
-    # Total
     count_result = await session.execute(
         select(func.count()).select_from(query.subquery())
     )
     total = count_result.scalar_one()
 
-    # Pagination + tri
     offset = (page - 1) * per_page
-    query = query.order_by(Voyage.date_depart.asc()).offset(offset).limit(per_page)
+    query  = query.order_by(Voyage.date_depart.asc()).offset(offset).limit(per_page)
 
-    result = await session.execute(query)
+    result  = await session.execute(query)
     voyages = result.scalars().all()
 
     return VoyageListResponse(
@@ -158,12 +151,12 @@ async def create_voyage(
         date_depart=data.date_depart,
         date_retour=data.date_retour,
         capacite_max=data.capacite_max,
+        nb_inscrits=0,
         actif=True,
         id_admin=id_admin,
     )
     session.add(voyage)
     await session.flush()
-    # Recharger avec la relation admin
     result = await session.execute(
         select(Voyage).options(selectinload(Voyage.admin)).where(Voyage.id == voyage.id)
     )

@@ -25,6 +25,11 @@ class Voyage(Base):
     date_depart: Mapped[date] = mapped_column(Date, nullable=False)
     date_retour: Mapped[date] = mapped_column(Date, nullable=False)
     capacite_max: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # ── Compteur d'inscrits ───────────────────────────────────────────────────
+    # Incrémenté au paiement (CONFIRMEE), décrémenté à l'annulation (ANNULEE)
+    nb_inscrits: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
     actif: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     id_admin: Mapped[Optional[int]] = mapped_column(
         BigInteger,

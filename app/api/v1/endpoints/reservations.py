@@ -6,6 +6,7 @@ Routes :
   POST  /reservations/chambres                      → Réserver chambre hôtel [CLIENT]
   POST  /reservations/visiteur                      → Réservation hôtel visiteur sans compte
                                                       + envoi automatique du voucher par email
+                                                      + création automatique de la facture
   GET   /reservations/mes-reservations              → Mes réservations [CLIENT]
   GET   /reservations                               → Toutes [ADMIN]
   GET   /reservations/admin/enrichi                 → Clients + Visiteurs enrichis [ADMIN]
@@ -15,6 +16,8 @@ Routes :
   POST  /reservations/{id}/paiement                 → Payer [CLIENT]
   POST  /reservations/{id}/annuler                  → Annuler [CLIENT|ADMIN]
   GET   /reservations/visiteur/{v}/pdf              → Voucher PDF visiteur hôtel
+  GET   /reservations/visiteur/{v}/facture-pdf      → Facture PDF visiteur [ADMIN]
+  POST  /reservations/visiteur/{id}/annuler         → Annuler réservation visiteur [ADMIN]
   GET   /reservations/{id}/voucher-pdf              → Voucher PDF client (hôtel ou voyage)
 
   💡 Les commissions partenaires (10%) sont créées automatiquement
@@ -46,7 +49,7 @@ from app.schemas.reservation import (
     ReservationResponse, ReservationVoyageCreate,
 )
 from app.models.reservation import (
-    Reservation, Facture,
+    Reservation, Facture, StatutFacture,
     ReservationVisiteur as _RV,
 )
 from app.models.hotel import Chambre as _Ch, Tarif as _T
@@ -104,6 +107,7 @@ class VisiteurReservationRequest(_BM):
 class VisiteurReservationResponse(_BM):
     id:             int
     numero_voucher: str
+    numero_facture: Optional[str] = None   # ← NOUVEAU
     montant_total:  float
     statut:         str
     email:          str
@@ -122,7 +126,7 @@ class VisiteurReservationResponse(_BM):
     "/visiteur",
     response_model=VisiteurReservationResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Réservation hôtel visiteur sans compte (+ envoi voucher PDF par email)",
+    summary="Réservation hôtel visiteur sans compte (+ voucher email + facture auto)",
 )
 async def reserver_visiteur(
     data: VisiteurReservationRequest,
@@ -130,6 +134,7 @@ async def reserver_visiteur(
 ):
     from datetime import date as _date
     from app.models.hotel import Hotel as _H
+    from app.services.reservation_service import _generate_numero_facture
 
     # ── 1. Valider les dates ───────────────────────────────
     try:
@@ -173,7 +178,7 @@ async def reserver_visiteur(
     cnt    = cnt_r.scalar_one() + 1
     numero_voucher = f"VIS-{annee}-{cnt:05d}-{_uuid.uuid4().hex[:4].upper()}"
 
-    # ── 5. Créer la réservation en base ────────────────────
+    # ── 5. Créer la réservation visiteur ───────────────────
     resa = _RV(
         nom              = data.nom,
         prenom           = data.prenom,
@@ -191,6 +196,24 @@ async def reserver_visiteur(
         numero_voucher   = numero_voucher,
     )
     session.add(resa)
+    await session.flush()  # obtenir resa.id sans commit
+
+    # ── 5b. Créer la facture et la lier à la réservation ───
+    # La facture est créée immédiatement (visiteur paie en ligne)
+    # id_reservation = None car la table facture pointe vers reservation (clients)
+    # et non reservation_visiteur — la relation se fait via reservation_visiteur.id_facture
+    numero_facture = await _generate_numero_facture(session)
+    facture_vis = Facture(
+        numero         = numero_facture,
+        montant_total  = total_ttc,
+        statut         = StatutFacture.PAYEE,
+        id_reservation = None,          # NULL pour les visiteurs
+    )
+    session.add(facture_vis)
+    await session.flush()  # obtenir facture_vis.id
+
+    # Lier la facture à la réservation visiteur
+    resa.id_facture = facture_vis.id
     await session.commit()
     await session.refresh(resa)
 
@@ -242,10 +265,11 @@ async def reserver_visiteur(
         )
     )
 
-    # ── 9. Retourner la réponse immédiatement ───────────────
+    # ── 9. Retourner la réponse ─────────────────────────────
     return VisiteurReservationResponse(
         id             = resa.id,
         numero_voucher = numero_voucher,
+        numero_facture = numero_facture,   # ← NOUVEAU
         montant_total  = total_ttc,
         statut         = resa.statut,
         email          = data.email,
@@ -435,8 +459,13 @@ async def list_reservations_enrichi(
     nb_clients = len(items)
 
     # ── 2. Réservations visiteurs ──────────────────────────
+    # On charge eagerly la facture pour éviter les N+1 queries
     if source in (None, "visiteur") and type_resa in (None, "hotel"):
-        vis_query = _sel(_RV).order_by(_RV.created_at.desc())
+        vis_query = (
+            _sel(_RV)
+            .options(_sil(_RV.facture))     # ← eager load facture
+            .order_by(_RV.created_at.desc())
+        )
         if statut:
             vis_query = vis_query.where(_RV.statut == statut)
 
@@ -445,6 +474,11 @@ async def list_reservations_enrichi(
 
         for vis in visiteurs:
             hotel_nom, hotel_ville = await _get_hotel_info(vis.id_chambre, session)
+
+            # Récupérer numéro et statut de la facture si elle existe
+            num_fac  = vis.facture.numero         if vis.facture else None
+            stat_fac = vis.facture.statut.value   if vis.facture else None
+
             items.append(ReservationAdminItem(
                 id                 = vis.id,
                 source             = "visiteur",
@@ -463,8 +497,8 @@ async def list_reservations_enrichi(
                 hotel_ville        = hotel_ville,
                 voyage_titre       = None,
                 voyage_destination = None,
-                numero_facture     = None,
-                statut_facture     = None,
+                numero_facture     = num_fac,      # ← FACTURE (plus None)
+                statut_facture     = stat_fac,     # ← STATUT facture
                 numero_voucher     = vis.numero_voucher,
                 methode_paiement   = vis.methode_paiement,
             ))
@@ -552,7 +586,6 @@ class PartenaireResaListResponse(_BM):
 
 
 async def _hotel_appartient_partenaire(hotel_id: int, partenaire_id: int, session) -> bool:
-    """Vérifie que l'hôtel appartient bien au partenaire connecté."""
     from app.models.hotel import Hotel
     res = await session.execute(
         _sel(Hotel).where(Hotel.id == hotel_id, Hotel.id_partenaire == partenaire_id)
@@ -561,15 +594,11 @@ async def _hotel_appartient_partenaire(hotel_id: int, partenaire_id: int, sessio
 
 
 async def _get_chambre_ids_hotel(hotel_id: int, session) -> list:
-    """Retourne la liste des id des chambres d'un hôtel."""
-    res = await session.execute(
-        _sel(_Ch.id).where(_Ch.id_hotel == hotel_id)
-    )
+    res = await session.execute(_sel(_Ch.id).where(_Ch.id_hotel == hotel_id))
     return [r[0] for r in res.all()]
 
 
 async def _get_chambre_nom(id_chambre: int, session) -> str:
-    """Retourne le nom du type de chambre depuis un id_chambre."""
     from app.models.hotel import TypeChambre
     ch_res = await session.execute(_sel(_Ch).where(_Ch.id == id_chambre))
     ch = ch_res.scalar_one_or_none()
@@ -780,7 +809,11 @@ async def partenaire_reservations_hotel(
 
     # ── VISITEURS ─────────────────────────────────────────
     if source in (None, "visiteur"):
-        vis_query = _sel(_RV).where(_RV.id_chambre.in_(chambre_ids))
+        vis_query = (
+            _sel(_RV)
+            .options(_sil(_RV.facture))    # ← eager load facture
+            .where(_RV.id_chambre.in_(chambre_ids))
+        )
         if statut:
             vis_query = vis_query.where(_RV.statut == statut)
         vis_query = vis_query.order_by(_RV.created_at.desc())
@@ -797,7 +830,11 @@ async def partenaire_reservations_hotel(
                     continue
 
             if numero_facture:
-                if numero_facture.lower() not in (vis.numero_voucher or "").lower():
+                # Chercher dans le numéro de facture OU le numéro de voucher
+                fac_num = vis.facture.numero if vis.facture else ""
+                vch_num = vis.numero_voucher or ""
+                if numero_facture.lower() not in fac_num.lower() and \
+                   numero_facture.lower() not in vch_num.lower():
                     continue
 
             ch_nom = await _get_chambre_nom(vis.id_chambre, session)
@@ -816,8 +853,8 @@ async def partenaire_reservations_hotel(
                 client_email     = vis.email,
                 client_telephone = vis.telephone,
                 chambre_nom      = ch_nom,
-                numero_facture   = None,
-                statut_facture   = None,
+                numero_facture   = vis.facture.numero         if vis.facture else None,
+                statut_facture   = vis.facture.statut.value   if vis.facture else None,
                 numero_voucher   = vis.numero_voucher,
                 methode_paiement = vis.methode_paiement,
                 nb_adultes       = vis.nb_adultes,
@@ -855,8 +892,6 @@ async def get_reservation(
 
 # ══════════════════════════════════════════════════════════
 #  PAYER
-#  💡 Commission créée automatiquement par le trigger SQL
-#     trg_commission_auto sur voyage_hotel.reservation
 # ══════════════════════════════════════════════════════════
 @router.post("/{reservation_id}/paiement", response_model=FactureResponse,
              status_code=status.HTTP_201_CREATED,
@@ -873,7 +908,7 @@ async def payer_reservation(
 
 
 # ══════════════════════════════════════════════════════════
-#  ANNULER
+#  ANNULER — CLIENT ou ADMIN (réservations clients)
 # ══════════════════════════════════════════════════════════
 @router.post("/{reservation_id}/annuler", response_model=ReservationResponse,
              summary="Annuler une réservation [CLIENT|ADMIN]")
@@ -1093,6 +1128,128 @@ async def download_voucher_visiteur(
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="voucher-{voucher_num}.pdf"'},
     )
+
+
+# ══════════════════════════════════════════════════════════
+#  FACTURE PDF — VISITEUR HÔTEL [ADMIN]
+#  Génère une vraie facture (format identique aux clients)
+# ══════════════════════════════════════════════════════════
+@router.get("/visiteur/{voucher_num}/facture-pdf", summary="Facture PDF visiteur [ADMIN]")
+async def download_facture_visiteur_admin(
+    voucher_num: str,
+    session: AsyncSession = Depends(get_db),
+    _token: TokenData = Depends(require_admin),
+):
+    from app.models.hotel import Hotel as _H
+    from app.utils.pdf_generator import generer_facture_pdf
+    from datetime import datetime
+
+    res  = await session.execute(
+        _sel(_RV).options(_sil(_RV.facture)).where(_RV.numero_voucher == voucher_num)
+    )
+    resa = res.scalar_one_or_none()
+    if not resa:
+        raise HTTPException(404, "Voucher introuvable")
+
+    ch_res = await session.execute(
+        _sel(_Ch).options(_sil(_Ch.type_chambre)).where(_Ch.id == resa.id_chambre)
+    )
+    chambre = ch_res.scalar_one_or_none()
+
+    hotel = None
+    if chambre:
+        h_res = await session.execute(_sel(_H).where(_H.id == chambre.id_hotel))
+        hotel = h_res.scalar_one_or_none()
+
+    chambre_nom  = chambre.type_chambre.nom if (chambre and chambre.type_chambre) else "Chambre"
+    hotel_nom    = hotel.nom if hotel else "—"
+    nb_nuits     = max((resa.date_fin - resa.date_debut).days, 1)
+    total_ttc    = float(resa.total_ttc)
+    prix_ht_nuit = round((total_ttc / 1.19) / nb_nuits, 3)
+
+    # Utiliser le numéro de facture si disponible, sinon le voucher
+    num_doc       = resa.facture.numero if resa.facture else resa.numero_voucher
+    date_emission = getattr(resa, "created_at", None) or datetime.now()
+
+    prestations = [{
+        "type":          "chambre",
+        "description":   f"{chambre_nom} — {hotel_nom}",
+        "nb_nuits":      nb_nuits,
+        "prix_unitaire": prix_ht_nuit,
+        "quantite":      nb_nuits,
+    }]
+
+    pdf_bytes = generer_facture_pdf(
+        numero_facture   = num_doc,
+        date_emission    = date_emission,
+        statut_facture   = "PAYEE",
+        client_nom       = resa.nom,
+        client_prenom    = resa.prenom,
+        client_email     = resa.email,
+        client_telephone = getattr(resa, "telephone", None),
+        date_debut       = resa.date_debut.strftime("%d/%m/%Y"),
+        date_fin         = resa.date_fin.strftime("%d/%m/%Y"),
+        nb_nuits         = nb_nuits,
+        prestations      = prestations,
+        total_ttc        = total_ttc,
+    )
+
+    filename = f"facture-{num_doc}.pdf"
+    return _SR(
+        _io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ══════════════════════════════════════════════════════════
+#  ANNULER — RÉSERVATION VISITEUR [ADMIN]
+# ══════════════════════════════════════════════════════════
+@router.post(
+    "/visiteur/{visiteur_id}/annuler",
+    summary="Annuler une réservation visiteur [ADMIN]",
+)
+async def annuler_reservation_visiteur(
+    visiteur_id: int,
+    session: AsyncSession = Depends(get_db),
+    _token: TokenData = Depends(require_admin),
+):
+    """
+    Annule une réservation visiteur :
+    - Passe statut → ANNULEE dans reservation_visiteur
+    - Annule la facture associée si elle existe (statut → ANNULEE)
+    """
+    res  = await session.execute(
+        _sel(_RV)
+        .options(_sil(_RV.facture))
+        .where(_RV.id == visiteur_id)
+    )
+    resa = res.scalar_one_or_none()
+    if not resa:
+        raise HTTPException(404, "Réservation visiteur introuvable")
+
+    if resa.statut == "ANNULEE":
+        raise HTTPException(409, "Cette réservation est déjà annulée")
+
+    if resa.statut == "TERMINEE":
+        raise HTTPException(409, "Impossible d'annuler une réservation terminée")
+
+    # Annuler la réservation
+    resa.statut = "ANNULEE"
+
+    # Annuler la facture associée si elle existe
+    if resa.facture:
+        resa.facture.statut = StatutFacture.ANNULEE
+
+    await session.commit()
+
+    return {
+        "message":        f"Réservation visiteur #{visiteur_id} annulée avec succès",
+        "id":             visiteur_id,
+        "statut":         "ANNULEE",
+        "numero_facture": resa.facture.numero if resa.facture else None,
+        "numero_voucher": resa.numero_voucher,
+    }
 
 
 # ══════════════════════════════════════════════════════════

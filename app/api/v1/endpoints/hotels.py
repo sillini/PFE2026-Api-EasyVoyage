@@ -292,29 +292,37 @@ async def delete_chambre(
 #  DISPONIBILITÉS
 # ═══════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════
+#  REMPLACER dans app/api/v1/endpoints/hotels.py
+#  la route GET /{hotel_id}/disponibilites/public
+# ═══════════════════════════════════════════════════════════
+
 @router.get(
     "/{hotel_id}/disponibilites/public",
     response_model=HotelDisponibilitesResponse,
     summary="Disponibilités publiques — chambres disponibles uniquement [PUBLIC]",
 )
 async def get_hotel_disponibilites_public(
-    hotel_id:   int,
-    date_debut: date = Query(...),
-    date_fin:   date = Query(...),
-    session: AsyncSession = Depends(get_db),
+    hotel_id:     int,
+    date_debut:   date           = Query(...),
+    date_fin:     date           = Query(...),
+    capacite_min: Optional[int]  = Query(None, ge=1, description="Capacité minimale (adultes + enfants)"),
+    session:      AsyncSession   = Depends(get_db),
 ):
     """
     Endpoint sans authentification pour visiteurs et clients.
     - Les types de chambres entièrement réservés sont MASQUÉS.
     - Seules les chambres réellement disponibles sont retournées.
+    - Si capacite_min est fourni, seules les chambres avec capacite >= capacite_min sont retournées.
     """
     if date_fin <= date_debut:
         from fastapi import HTTPException
         raise HTTPException(status_code=422, detail="date_fin doit être après date_debut")
     return await hotel_service.get_hotel_disponibilites(
-        hotel_id, date_debut, date_fin, session, role="PUBLIC"
+        hotel_id, date_debut, date_fin, session,
+        role="PUBLIC",
+        capacite_min=capacite_min,
     )
-
 
 @router.get(
     "/{hotel_id}/disponibilites",

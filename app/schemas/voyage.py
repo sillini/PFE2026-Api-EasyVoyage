@@ -65,6 +65,8 @@ class VoyageResponse(BaseModel):
     date_depart: date
     date_retour: date
     capacite_max: int
+    nb_inscrits: int = 0         # ← nombre de personnes avec réservation CONFIRMEE
+    places_restantes: int = 0    # ← calculé côté service : capacite_max - nb_inscrits
     actif: bool
     id_admin: Optional[int] = None
     admin: Optional[AdminInfo] = None
