@@ -71,9 +71,15 @@ class SoldePartenaire(BaseModel):
     partenaire_email:  str
     nom_entreprise:    str
     solde_du:          float
-    nb_commissions:    int
-
-
+    # ── Champs enrichis ──────────────────────────────────
+    revenu_hotel:      float = 0.0   # revenu hôtel total (clients + visiteurs)
+    commission_agence: float = 0.0   # 10% du revenu hôtel
+    montant_paye:      float = 0.0   # déjà versé
+    nb_commissions:    int            # clients EN_ATTENTE dans commission_partenaire
+    nb_reservations_visiteurs: int = 0  # visiteurs confirmés/terminés
+    nb_reservations_total:     int = 0  # total = clients + visiteurs
+ 
+ 
 class SoldesPartenairesResponse(BaseModel):
     items: List[SoldePartenaire]
 
@@ -89,17 +95,20 @@ class PayerPartenaireResponse(BaseModel):
 
 
 class PaiementHistoriqueItem(BaseModel):
-    id:                int
+    # id supprimé — non affiché côté interface
     id_partenaire:     int
     partenaire_nom:    str
     partenaire_prenom: str
+    partenaire_email:  str                   # ← NOUVEAU
+    partenaire_tel:    Optional[str] = None  # ← NOUVEAU
+    nom_entreprise:    str = "—"             # ← NOUVEAU
     montant:           float
     note:              Optional[str] = None
     created_at:        datetime
-
+ 
     class Config:
         from_attributes = True
-
+ 
 
 class PaiementHistoriqueResponse(BaseModel):
     total:    int
@@ -205,10 +214,13 @@ class HotelFinanceListResponse(BaseModel):
 # ═══════════════════════════════════════════════════════════
 
 class ReservationFinanceItem(BaseModel):
-    id_commission:     int
-    id_reservation:    int
+    """
+    Réservation dans le drill-down hôtel — clients ET visiteurs.
+    client_email ajouté pour l'affichage et la recherche frontend.
+    """
+    type_source:       str
     client_nom:        str
-    date_reservation:  Optional[datetime] = None
+    client_email:      Optional[str]  = None   # ← NOUVEAU
     date_debut:        Optional[date]     = None
     date_fin:          Optional[date]     = None
     montant_total:     float
@@ -217,11 +229,10 @@ class ReservationFinanceItem(BaseModel):
     taux_commission:   float
     statut_commission: str
     date_paiement:     Optional[datetime] = None
-
+ 
     class Config:
         from_attributes = True
-
-
+ 
 class ReservationFinanceListResponse(BaseModel):
     total:    int
     page:     int
