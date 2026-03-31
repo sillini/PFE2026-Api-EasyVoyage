@@ -142,26 +142,53 @@ async def fetch_montant_paye_par_hotel(
     session: AsyncSession,
     id_partenaire: int,
     chambre_ids: list[int],
+    revenu_hotel_hotel: float = 0.0,
+    revenu_hotel_total: float = 0.0,
 ) -> float:
     """
-    Montant déjà payé pour un hôtel précis.
-    Estimé depuis commission_partenaire PAYEE (seule source disponible
-    pour ventiler les paiements par hôtel).
+    Montant payé pour un hôtel précis — lecture directe des tables de commission.
+
+    clients  : commission_partenaire PAYEE liées aux chambres de cet hôtel
+    visiteurs: commission_visiteur   PAYEE liées aux chambres de cet hôtel
+               (auto-peuplée par le trigger trg_commission_visiteur_auto)
+
+    0 approximation — 0 ventilation — résultat exact par hôtel.
     """
+    from sqlalchemy import text as sa_text
+
     if not chambre_ids:
         return 0.0
+
+    # ── Clients : commission_partenaire PAYEE ─────────────────────────
     resa_ids = await fetch_reservation_ids_clients(session, chambre_ids)
-    if not resa_ids:
-        return 0.0
-    r = await session.execute(
-        select(func.coalesce(func.sum(CommissionPartenaire.montant_partenaire), 0))
-        .where(
-            CommissionPartenaire.id_partenaire == id_partenaire,
-            CommissionPartenaire.id_reservation.in_(resa_ids),
-            cast(CommissionPartenaire.statut, String) == "PAYEE",
+    paye_clients = 0.0
+    if resa_ids:
+        r = await session.execute(
+            select(func.coalesce(func.sum(CommissionPartenaire.montant_partenaire), 0))
+            .where(
+                CommissionPartenaire.id_partenaire == id_partenaire,
+                CommissionPartenaire.id_reservation.in_(resa_ids),
+                cast(CommissionPartenaire.statut, String) == "PAYEE",
+            )
         )
+        paye_clients = float(r.scalar_one() or 0)
+
+    # ── Visiteurs : commission_visiteur PAYEE ─────────────────────────
+    r_vis = await session.execute(
+        sa_text("""
+            SELECT COALESCE(SUM(cv.montant_partenaire), 0)
+            FROM voyage_hotel.commission_visiteur cv
+            JOIN voyage_hotel.reservation_visiteur rv
+              ON rv.id = cv.id_reservation_visiteur
+            WHERE rv.id_chambre = ANY(:ch_ids)
+              AND cv.id_partenaire = :id_p
+              AND cv.statut = 'PAYEE'
+        """),
+        {"ch_ids": list(chambre_ids), "id_p": id_partenaire}
     )
-    return float(r.scalar_one() or 0)
+    paye_visiteurs = float(r_vis.scalar_one() or 0)
+
+    return round(paye_clients + paye_visiteurs, 2)
 
 
 # ═══════════════════════════════════════════════════════════

@@ -288,6 +288,15 @@ async def get_hotels_finances_partenaire(
     part = part_res.scalar_one_or_none()
     taux = float(part.commission) if part and part.commission else TAUX_COMMISSION_DEFAULT
 
+    # ── Pré-calcul : revenu total du partenaire (tous hôtels) pour la ventilation ──
+    all_hotel_ids = [h.id for h in hotels]
+    revenu_total_partenaire = 0.0
+    if all_hotel_ids:
+        all_ch = [r[0] for r in (await session.execute(
+            select(Chambre.id).where(Chambre.id_hotel.in_(all_hotel_ids))
+        )).all()]
+        revenu_total_partenaire, _ = await fetch_revenu_hotel_par_chambres(session, all_ch)
+
     items = []
     for hotel in hotels:
         ch_res = await session.execute(
@@ -304,8 +313,14 @@ async def get_hotels_finances_partenaire(
 
         commission = calc_commission_agence(revenu_hotel, taux)
         part_rev   = calc_part_partenaire(revenu_hotel, taux)
-        paye       = await fetch_montant_paye_par_hotel(session, id_partenaire, chambre_ids)
-        solde      = calc_solde_restant(part_rev, paye)
+
+        # Montant payé ventilé : clients exacts + visiteurs proportionnels
+        paye  = await fetch_montant_paye_par_hotel(
+            session, id_partenaire, chambre_ids,
+            revenu_hotel_hotel=revenu_hotel,
+            revenu_hotel_total=revenu_total_partenaire,
+        )
+        solde = calc_solde_restant(part_rev, paye)
 
         items.append(HotelFinanceDetail(
             id_hotel          = hotel.id,
@@ -342,32 +357,54 @@ async def get_reservations_finances_hotel(
     page: int = 1,
     per_page: int = 20,
 ) -> ReservationFinanceListResponse:
+    """
+    Retourne les réservations de l'hôtel en fusionnant CLIENTS + VISITEURS.
+    - Clients  : via commission_partenaire (statut de paiement géré)
+    - Visiteurs: via reservation_visiteur WHERE id_chambre IN chambre_ids
+    """
     from app.models.hotel import Chambre
+    from app.models.reservation import ReservationVisiteur
+    from app.services.finances.utils import TAUX_COMMISSION_DEFAULT
+    from app.models.utilisateur import Partenaire as PartenaireModel
 
     ch_res = await session.execute(
         select(Chambre.id).where(Chambre.id_hotel == id_hotel)
     )
     chambre_ids = [r[0] for r in ch_res.all()]
 
-    commissions, total = await fetch_commissions_pour_hotel(
-        session, id_partenaire, chambre_ids, statut_commission, page, per_page
+    if not chambre_ids:
+        return ReservationFinanceListResponse(total=0, page=page, per_page=per_page, items=[])
+
+    # ── Taux du partenaire ────────────────────────────────
+    part_row = (await session.execute(
+        select(PartenaireModel).where(PartenaireModel.id == id_partenaire)
+    )).scalar_one_or_none()
+    taux = float(part_row.commission) if part_row and part_row.commission else TAUX_COMMISSION_DEFAULT
+
+    # ── 1. Clients (commission_partenaire) — charge tout pour fusion ──
+    commissions, _ = await fetch_commissions_pour_hotel(
+        session, id_partenaire, chambre_ids,
+        statut_commission if statut_commission in ("EN_ATTENTE", "PAYEE") else None,
+        1, 10000,
     )
 
     items = []
     for c in commissions:
         r = c.reservation
-        client_nom = "—"
+        client_nom   = "—"
+        client_email = None
         if r and r.id_client:
             usr = (await session.execute(
                 select(Utilisateur).where(Utilisateur.id == r.id_client)
             )).scalar_one_or_none()
             if usr:
-                client_nom = f"{usr.prenom} {usr.nom}"
+                client_nom   = f"{usr.prenom} {usr.nom}"
+                client_email = usr.email
 
         items.append(ReservationFinanceItem(
-            id_commission     = c.id,
-            id_reservation    = c.id_reservation,
+            type_source       = "client",
             client_nom        = client_nom,
+            client_email      = client_email,
             date_debut        = r.date_debut if r else None,
             date_fin          = r.date_fin   if r else None,
             montant_total     = float(c.montant_total_resa),
@@ -378,7 +415,80 @@ async def get_reservations_finances_hotel(
             date_paiement     = c.date_paiement,
         ))
 
-    return ReservationFinanceListResponse(total=total, page=page, per_page=per_page, items=items)
+    # ── 2. Visiteurs (reservation_visiteur) ──────────────
+    # Le statut est lu depuis commission_visiteur (table créée par migration)
+    # ce qui permet d'afficher PAYEE après paiement du partenaire
+    from sqlalchemy import text as sa_text
+
+    # Requête jointe : visiteur + statut depuis commission_visiteur
+    vis_query = sa_text("""
+        SELECT
+            rv.id, rv.nom, rv.prenom, rv.email,
+            rv.date_debut, rv.date_fin, rv.total_ttc, rv.created_at,
+            COALESCE(cv.statut, 'EN_ATTENTE') AS statut_comm,
+            cv.date_paiement                 AS date_paiement_comm
+        FROM voyage_hotel.reservation_visiteur rv
+        LEFT JOIN voyage_hotel.commission_visiteur cv ON cv.id_reservation_visiteur = rv.id
+            AND cv.id_partenaire = :id_p
+        WHERE rv.id_chambre = ANY(:chambre_ids)
+          AND rv.statut IN ('CONFIRMEE', 'TERMINEE')
+        ORDER BY rv.date_debut DESC
+    """)
+
+    # Filtre statut si demandé
+    if statut_commission in ("EN_ATTENTE", "PAYEE"):
+        vis_query = sa_text("""
+            SELECT
+                rv.id, rv.nom, rv.prenom, rv.email,
+                rv.date_debut, rv.date_fin, rv.total_ttc, rv.created_at,
+                COALESCE(cv.statut, 'EN_ATTENTE') AS statut_comm,
+                cv.date_paiement                  AS date_paiement_comm
+            FROM voyage_hotel.reservation_visiteur rv
+            LEFT JOIN voyage_hotel.commission_visiteur cv ON cv.id_reservation_visiteur = rv.id
+                AND cv.id_partenaire = :id_p
+            WHERE rv.id_chambre = ANY(:chambre_ids)
+              AND rv.statut IN ('CONFIRMEE', 'TERMINEE')
+              AND COALESCE(cv.statut, 'EN_ATTENTE') = :statut
+            ORDER BY rv.date_debut DESC
+        """)
+        vis_result = await session.execute(
+            vis_query,
+            {"id_p": id_partenaire, "chambre_ids": list(chambre_ids), "statut": statut_commission}
+        )
+    else:
+        vis_result = await session.execute(
+            vis_query,
+            {"id_p": id_partenaire, "chambre_ids": list(chambre_ids)}
+        )
+
+    vis_rows = vis_result.mappings().all()
+
+    for v in vis_rows:
+        montant    = float(v["total_ttc"])
+        commission = calc_commission_agence(montant, taux)
+        part       = calc_part_partenaire(montant, taux)
+
+        items.append(ReservationFinanceItem(
+            type_source       = "visiteur",
+            client_nom        = f"{v['prenom']} {v['nom']}",
+            client_email      = v["email"],
+            date_debut        = v["date_debut"],
+            date_fin          = v["date_fin"],
+            montant_total     = montant,
+            commission_agence = commission,
+            part_partenaire   = part,
+            taux_commission   = taux,
+            statut_commission = v["statut_comm"],
+            date_paiement     = v["date_paiement_comm"],
+        ))
+
+    # ── 3. Tri par date décroissante + pagination manuelle ──
+    items.sort(key=lambda x: x.date_debut or date.min, reverse=True)
+    total  = len(items)
+    start  = (page - 1) * per_page
+    paged  = items[start: start + per_page]
+
+    return ReservationFinanceListResponse(total=total, page=page, per_page=per_page, items=paged)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -441,17 +551,25 @@ async def get_soldes_partenaires(session: AsyncSession) -> SoldesPartenairesResp
             session, chambre_ids
         )
 
-        # ── 5. Nombre de réservations visiteurs en attente de paiement ──
-        # = visiteurs confirmés/terminés (ils sont tous "EN_ATTENTE" côté commission)
+        # ── 5. Nombre de réservations visiteurs EN ATTENTE de paiement ──
+        # Lu depuis commission_visiteur pour respecter le statut réel après paiement
         nb_visiteurs = 0
         if chambre_ids:
-            nb_visiteurs = (await session.execute(
-                select(func.count(ReservationVisiteur.id))
-                .where(
-                    ReservationVisiteur.id_chambre.in_(chambre_ids),
-                    ReservationVisiteur.statut.in_(["CONFIRMEE", "TERMINEE"]),
-                )
-            )).scalar_one() or 0
+            from sqlalchemy import text as sa_text
+            r_vis = await session.execute(
+                sa_text("""
+                    SELECT COUNT(rv.id)
+                    FROM voyage_hotel.reservation_visiteur rv
+                    LEFT JOIN voyage_hotel.commission_visiteur cv
+                        ON cv.id_reservation_visiteur = rv.id
+                        AND cv.id_partenaire = :id_p
+                    WHERE rv.id_chambre = ANY(:ch_ids)
+                      AND rv.statut IN ('CONFIRMEE', 'TERMINEE')
+                      AND COALESCE(cv.statut, 'EN_ATTENTE') = 'EN_ATTENTE'
+                """),
+                {"id_p": usr.id, "ch_ids": list(chambre_ids) if chambre_ids else [0]}
+            )
+            nb_visiteurs = int(r_vis.scalar_one() or 0)
 
         # ── 6. Calculs financiers ──
         commission_agence = calc_commission_agence(revenu_hotel, taux)
@@ -579,7 +697,25 @@ async def payer_partenaire(
             {"dt": now, "id_p": id_partenaire},
         )
 
-    # ── 8. Enregistrer le vrai montant (clients + visiteurs) ──
+    # ── 8. Marquer les visiteurs PAYEE dans commission_visiteur ───────────
+    # commission_visiteur est la table symétrique de commission_partenaire
+    # pour les réservations visiteurs (créée par migration_commission_visiteur.sql)
+    if chambre_ids:
+        await session.execute(
+            text(
+                "UPDATE voyage_hotel.commission_visiteur cv "
+                "SET statut = 'PAYEE', date_paiement = :dt "
+                "FROM voyage_hotel.reservation_visiteur rv "
+                "JOIN chambre c ON c.id = rv.id_chambre "
+                "WHERE cv.id_reservation_visiteur = rv.id "
+                "AND cv.id_partenaire = :id_p "
+                "AND cv.statut = 'EN_ATTENTE' "
+                "AND rv.statut IN ('CONFIRMEE', 'TERMINEE')"
+            ),
+            {"dt": now, "id_p": id_partenaire},
+        )
+
+    # ── 9. Enregistrer le vrai montant (clients + visiteurs) ──
     montant_final = round(solde_reel if solde_reel > 0 else
                           sum(float(c.montant_partenaire) for c in commissions_clients), 2)
 
