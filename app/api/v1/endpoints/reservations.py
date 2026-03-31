@@ -55,6 +55,7 @@ from app.models.reservation import (
 from app.models.hotel import Chambre as _Ch, Tarif as _T
 from app.models.voyage import Voyage as _Voyage
 from app.services.email_service import send_voucher_email as _send_voucher_email
+from app.services.contact_service import upsert_contact   # ← NOUVEAU
 import app.services.reservation_service as reservation_service
 
 router = APIRouter(prefix="/reservations", tags=["Réservations"])
@@ -107,7 +108,7 @@ class VisiteurReservationRequest(_BM):
 class VisiteurReservationResponse(_BM):
     id:             int
     numero_voucher: str
-    numero_facture: Optional[str] = None   # ← NOUVEAU
+    numero_facture: Optional[str] = None
     montant_total:  float
     statut:         str
     email:          str
@@ -196,24 +197,32 @@ async def reserver_visiteur(
         numero_voucher   = numero_voucher,
     )
     session.add(resa)
-    await session.flush()  # obtenir resa.id sans commit
+    await session.flush()
 
     # ── 5b. Créer la facture et la lier à la réservation ───
-    # La facture est créée immédiatement (visiteur paie en ligne)
-    # id_reservation = None car la table facture pointe vers reservation (clients)
-    # et non reservation_visiteur — la relation se fait via reservation_visiteur.id_facture
     numero_facture = await _generate_numero_facture(session)
     facture_vis = Facture(
         numero         = numero_facture,
         montant_total  = total_ttc,
         statut         = StatutFacture.PAYEE,
-        id_reservation = None,          # NULL pour les visiteurs
+        id_reservation = None,
     )
     session.add(facture_vis)
-    await session.flush()  # obtenir facture_vis.id
+    await session.flush()
 
-    # Lier la facture à la réservation visiteur
     resa.id_facture = facture_vis.id
+
+    # ── 5c. Sync contact visiteur ──────────────────────────
+    await upsert_contact(
+        session,
+        email     = data.email,
+        telephone = data.telephone,
+        nom       = data.nom,
+        prenom    = data.prenom,
+        type      = "visiteur",
+        source_id = resa.id,
+    )
+
     await session.commit()
     await session.refresh(resa)
 
@@ -269,7 +278,7 @@ async def reserver_visiteur(
     return VisiteurReservationResponse(
         id             = resa.id,
         numero_voucher = numero_voucher,
-        numero_facture = numero_facture,   # ← NOUVEAU
+        numero_facture = numero_facture,
         montant_total  = total_ttc,
         statut         = resa.statut,
         email          = data.email,
@@ -459,11 +468,10 @@ async def list_reservations_enrichi(
     nb_clients = len(items)
 
     # ── 2. Réservations visiteurs ──────────────────────────
-    # On charge eagerly la facture pour éviter les N+1 queries
     if source in (None, "visiteur") and type_resa in (None, "hotel"):
         vis_query = (
             _sel(_RV)
-            .options(_sil(_RV.facture))     # ← eager load facture
+            .options(_sil(_RV.facture))
             .order_by(_RV.created_at.desc())
         )
         if statut:
@@ -475,7 +483,6 @@ async def list_reservations_enrichi(
         for vis in visiteurs:
             hotel_nom, hotel_ville = await _get_hotel_info(vis.id_chambre, session)
 
-            # Récupérer numéro et statut de la facture si elle existe
             num_fac  = vis.facture.numero         if vis.facture else None
             stat_fac = vis.facture.statut.value   if vis.facture else None
 
@@ -497,8 +504,8 @@ async def list_reservations_enrichi(
                 hotel_ville        = hotel_ville,
                 voyage_titre       = None,
                 voyage_destination = None,
-                numero_facture     = num_fac,      # ← FACTURE (plus None)
-                statut_facture     = stat_fac,     # ← STATUT facture
+                numero_facture     = num_fac,
+                statut_facture     = stat_fac,
                 numero_voucher     = vis.numero_voucher,
                 methode_paiement   = vis.methode_paiement,
             ))
@@ -811,7 +818,7 @@ async def partenaire_reservations_hotel(
     if source in (None, "visiteur"):
         vis_query = (
             _sel(_RV)
-            .options(_sil(_RV.facture))    # ← eager load facture
+            .options(_sil(_RV.facture))
             .where(_RV.id_chambre.in_(chambre_ids))
         )
         if statut:
@@ -830,7 +837,6 @@ async def partenaire_reservations_hotel(
                     continue
 
             if numero_facture:
-                # Chercher dans le numéro de facture OU le numéro de voucher
                 fac_num = vis.facture.numero if vis.facture else ""
                 vch_num = vis.numero_voucher or ""
                 if numero_facture.lower() not in fac_num.lower() and \
@@ -1132,7 +1138,6 @@ async def download_voucher_visiteur(
 
 # ══════════════════════════════════════════════════════════
 #  FACTURE PDF — VISITEUR HÔTEL [ADMIN]
-#  Génère une vraie facture (format identique aux clients)
 # ══════════════════════════════════════════════════════════
 @router.get("/visiteur/{voucher_num}/facture-pdf", summary="Facture PDF visiteur [ADMIN]")
 async def download_facture_visiteur_admin(
@@ -1167,7 +1172,6 @@ async def download_facture_visiteur_admin(
     total_ttc    = float(resa.total_ttc)
     prix_ht_nuit = round((total_ttc / 1.19) / nb_nuits, 3)
 
-    # Utiliser le numéro de facture si disponible, sinon le voucher
     num_doc       = resa.facture.numero if resa.facture else resa.numero_voucher
     date_emission = getattr(resa, "created_at", None) or datetime.now()
 
@@ -1214,11 +1218,6 @@ async def annuler_reservation_visiteur(
     session: AsyncSession = Depends(get_db),
     _token: TokenData = Depends(require_admin),
 ):
-    """
-    Annule une réservation visiteur :
-    - Passe statut → ANNULEE dans reservation_visiteur
-    - Annule la facture associée si elle existe (statut → ANNULEE)
-    """
     res  = await session.execute(
         _sel(_RV)
         .options(_sil(_RV.facture))
@@ -1234,10 +1233,8 @@ async def annuler_reservation_visiteur(
     if resa.statut == "TERMINEE":
         raise HTTPException(409, "Impossible d'annuler une réservation terminée")
 
-    # Annuler la réservation
     resa.statut = "ANNULEE"
 
-    # Annuler la facture associée si elle existe
     if resa.facture:
         resa.facture.statut = StatutFacture.ANNULEE
 

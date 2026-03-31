@@ -536,3 +536,7 @@ async def confirm_password_change(
 
     logger.info(f"[PROFIL] Mot de passe modifié pour user_id={user_id}")
     return {"message": "Mot de passe modifié avec succès"}
+
+
+
+

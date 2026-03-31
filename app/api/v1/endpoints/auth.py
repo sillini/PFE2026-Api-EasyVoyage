@@ -23,6 +23,7 @@ from app.schemas.auth import (
     UserMeResponse,
 )
 import app.services.auth_service as auth_service
+from app.services.contact_service import upsert_contact   # ← NOUVEAU
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -38,7 +39,24 @@ async def register_client(
     data: ClientRegisterRequest,
     session: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
-    return await auth_service.register_client(data, session)
+    token_response = await auth_service.register_client(data, session)
+
+    # ── Sync contact ──────────────────────────────────────
+    # Récupérer l'utilisateur créé pour obtenir son id
+    user = await auth_service._get_user_by_email(session, data.email)
+    if user:
+        await upsert_contact(
+            session,
+            email     = user.email,
+            telephone = user.telephone,
+            nom       = user.nom,
+            prenom    = user.prenom,
+            type      = "client",
+            source_id = user.id,
+        )
+        await session.commit()
+
+    return token_response
 
 
 @router.post(
@@ -116,13 +134,15 @@ async def logout(
     return
 
 
-# ── Profil Admin ──────────────────────────────────────────
+# ── Profil ────────────────────────────────────────────────
 from app.schemas.auth import (
     UpdateProfileRequest, RequestEmailChangeRequest, ConfirmEmailChangeRequest,
     ConfirmPasswordChangeRequest, ProfileOTPResponse,
 )
 
-@router.put("/me", response_model=UserMeResponse, summary="Modifier le profil (nom, prénom, téléphone)")
+
+@router.put("/me", response_model=UserMeResponse,
+            summary="Modifier le profil (nom, prénom, téléphone)")
 async def update_profile(
     data: UpdateProfileRequest,
     token_data: TokenData = Depends(get_current_user),
@@ -138,7 +158,9 @@ async def request_email_change(
     token_data: TokenData = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ):
-    return await auth_service.request_email_change(token_data.user_id, data.new_email, session)
+    return await auth_service.request_email_change(
+        token_data.user_id, data.new_email, session
+    )
 
 
 @router.post("/me/confirm-email-change", response_model=UserMeResponse,
@@ -148,7 +170,9 @@ async def confirm_email_change(
     token_data: TokenData = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ):
-    return await auth_service.confirm_email_change(token_data.user_id, data.new_email, data.code, session)
+    return await auth_service.confirm_email_change(
+        token_data.user_id, data.new_email, data.code, session
+    )
 
 
 @router.post("/me/request-password-change", response_model=ProfileOTPResponse,
@@ -172,16 +196,21 @@ async def confirm_password_change(
     )
 
 
-
 # ── Google OAuth ──────────────────────────────────────────
 from pydantic import BaseModel as _BM
 import httpx as _httpx
-from app.models.utilisateur import Utilisateur as _Utilisateur, Client as _Client, RoleUtilisateur as _Role
+from app.models.utilisateur import (
+    Utilisateur as _Utilisateur,
+    Client as _Client,
+    RoleUtilisateur as _Role,
+)
 from app.core.security import hash_password as _hash_pw
 import secrets as _secrets
 
+
 class GoogleAuthRequest(_BM):
     credential: str  # JWT token from Google GSI
+
 
 @router.post("/google", response_model=TokenResponse,
              summary="Connexion / inscription via Google OAuth")
@@ -223,5 +252,17 @@ async def google_auth(
         session.add(_Client(id=user.id))
         await session.commit()
         await session.refresh(user)
+
+        # ── Sync contact (nouveau compte Google uniquement) ──
+        await upsert_contact(
+            session,
+            email     = user.email,
+            telephone = None,
+            nom       = user.nom,
+            prenom    = user.prenom,
+            type      = "client",
+            source_id = user.id,
+        )
+        await session.commit()
 
     return auth_service._build_token_response(user)
