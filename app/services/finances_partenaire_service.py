@@ -1,21 +1,11 @@
 """
 app/services/finances_partenaire_service.py
 ============================================
-Logique métier du module Finance — Espace Partenaire.
+Logique métier — Espace Partenaire.
 
-CORRECTIONS apportées :
-  - get_reservations_hotel → clients   : lit statut depuis commission_client
-                                         (fallback commission_partenaire si table absente)
-  - get_reservations_hotel → visiteurs : lit statut depuis commission_visiteur
-                                         (n'était jamais lu → toujours EN_ATTENTE avant)
-  - Les deux requêtes utilisent désormais SQL brut avec LEFT JOIN,
-    identique à la logique admin (finances/service.py).
-
-Règles fondamentales conservées :
-  - Toutes les fonctions sont SCOPÉES sur id_partenaire (JWT).
-  - Revenu = clients + visiteurs.
-  - Part partenaire = 90 % du montant brut (taux_commission = 10 %).
-  - Solde disponible = part totale - déjà versé.
+NOUVEAU : demander_retrait() insère dans withdraw_requests (statut EN_ATTENTE)
+          et NON plus dans paiement_partenaire.
+          Le solde disponible tient compte des demandes EN_ATTENTE en cours.
 """
 from __future__ import annotations
 
@@ -24,7 +14,6 @@ from typing import Optional
 
 from sqlalchemy import select, func, extract, and_, or_, text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.models.utilisateur import Utilisateur
 from app.models.hotel import Hotel, Chambre
@@ -34,7 +23,12 @@ from app.models.reservation import (
     LigneReservationChambre,
     StatutReservation,
 )
-from app.models.finances import CommissionPartenaire, PaiementPartenaire, StatutCommission
+from app.models.finances import (
+    CommissionPartenaire,
+    PaiementPartenaire,
+    StatutCommission,
+    WithdrawRequest,
+)
 from app.schemas.finances_partenaire import (
     PartDashboard,
     PartRevenuMois,
@@ -47,13 +41,13 @@ from app.schemas.finances_partenaire import (
     PartPaiementsResponse,
     PartDemandeRetraitRequest,
     PartDemandeRetraitResponse,
+    PartDemandeItem,
+    PartDemandesResponse,
 )
 
-# Taux de commission de l'agence (10 %) → part partenaire = 90 %
 _TAUX_COMMISSION = 10.0
 _PART_PARTENAIRE = 1.0 - (_TAUX_COMMISSION / 100.0)   # 0.90
 
-# Statuts de réservation qui génèrent un revenu réel
 _STATUTS_VALIDES_CLIENT   = [StatutReservation.CONFIRMEE, StatutReservation.TERMINEE]
 _STATUTS_VALIDES_VISITEUR = ["CONFIRMEE", "TERMINEE"]
 
@@ -177,6 +171,30 @@ async def _montant_deja_verse(id_partenaire: int, session: AsyncSession) -> floa
     return float(result.scalar_one() or 0.0)
 
 
+async def _montant_en_attente(id_partenaire: int, session: AsyncSession) -> float:
+    """Somme des demandes de retrait EN_ATTENTE non encore validées."""
+    result = await session.execute(
+        select(func.coalesce(func.sum(WithdrawRequest.montant), 0.0))
+        .where(
+            WithdrawRequest.id_partenaire == id_partenaire,
+            WithdrawRequest.statut == "EN_ATTENTE",
+        )
+    )
+    return float(result.scalar_one() or 0.0)
+
+
+async def _calcul_solde(id_partenaire: int, chambre_ids: list[int], session: AsyncSession) -> float:
+    """Solde réellement disponible = part totale - versé - en attente."""
+    rev_total    = (
+        await _revenu_clients(session, chambre_ids)
+        + await _revenu_visiteurs(session, chambre_ids)
+    )
+    part_totale      = round(rev_total * _PART_PARTENAIRE, 2)
+    deja_verse       = await _montant_deja_verse(id_partenaire, session)
+    deja_en_attente  = await _montant_en_attente(id_partenaire, session)
+    return max(0.0, round(part_totale - deja_verse - deja_en_attente, 2))
+
+
 # ═══════════════════════════════════════════════════════════
 #  DASHBOARD
 # ═══════════════════════════════════════════════════════════
@@ -209,7 +227,7 @@ async def get_dashboard(
         extract("month", ReservationVisiteur.created_at) == mois_prec,
         extract("year",  ReservationVisiteur.created_at) == annee_prec,
     )
-    filtre_annee_client  = extract("year", Reservation.date_reservation) == annee
+    filtre_annee_client   = extract("year", Reservation.date_reservation) == annee
     filtre_annee_visiteur = extract("year", ReservationVisiteur.created_at) == annee
 
     rev_mois = (
@@ -228,18 +246,10 @@ async def get_dashboard(
         session, chambre_ids, filtre_mois_client, filtre_mois_visiteur
     )
 
-    rev_total_all = (
-        await _revenu_clients(session, chambre_ids)
-        + await _revenu_visiteurs(session, chambre_ids)
-    )
-    part_totale  = round(rev_total_all * _PART_PARTENAIRE, 2)
-    deja_verse   = await _montant_deja_verse(id_partenaire, session)
-    solde_dispo  = max(0.0, round(part_totale - deja_verse, 2))
+    # Solde disponible = part totale - versé - demandes EN_ATTENTE
+    solde_dispo = await _calcul_solde(id_partenaire, chambre_ids, session)
 
-    if rev_prec > 0:
-        evolution = round((rev_mois - rev_prec) / rev_prec * 100, 1)
-    else:
-        evolution = 0.0
+    evolution = round((rev_mois - rev_prec) / rev_prec * 100, 1) if rev_prec > 0 else 0.0
 
     return PartDashboard(
         solde_disponible=solde_dispo,
@@ -310,15 +320,15 @@ async def get_mes_hotels(
         .order_by(Hotel.nom.asc())
     )).scalars().all()
 
-    deja_verse_total = await _montant_deja_verse(id_partenaire, session)
-
-    chambre_ids_all = await _get_chambre_ids_partenaire(id_partenaire, session)
+    chambre_ids_all  = await _get_chambre_ids_partenaire(id_partenaire, session)
     rev_total_global = (
         await _revenu_clients(session, chambre_ids_all)
         + await _revenu_visiteurs(session, chambre_ids_all)
     )
     part_totale_global = round(rev_total_global * _PART_PARTENAIRE, 2)
-    solde_global       = max(0.0, round(part_totale_global - deja_verse_total, 2))
+    deja_verse_total   = await _montant_deja_verse(id_partenaire, session)
+    deja_en_attente    = await _montant_en_attente(id_partenaire, session)
+    solde_global       = max(0.0, round(part_totale_global - deja_verse_total - deja_en_attente, 2))
 
     items = []
     for hotel in hotels:
@@ -380,15 +390,6 @@ async def get_reservations_hotel(
     statut: Optional[str] = None,
     search: Optional[str] = None,
 ) -> PartReservationListResponse:
-    """
-    Retourne TOUTES les réservations (clients + visiteurs) d'un hôtel.
-    
-    CORRECTION :
-      - Clients  → statut lu depuis commission_client (fallback commission_partenaire)
-      - Visiteurs → statut lu depuis commission_visiteur
-      Les deux utilisent SQL brut avec LEFT JOIN, identique à l'espace admin.
-    """
-    # ── Vérification sécurité : l'hôtel appartient au partenaire ──
     hotel = (await session.execute(
         select(Hotel).where(
             Hotel.id == id_hotel,
@@ -406,12 +407,8 @@ async def get_reservations_hotel(
 
     items: list[PartReservationItem] = []
 
-    # ── 1. Réservations CLIENTS ──────────────────────────────────────
-    # Lit le statut de paiement depuis commission_client en priorité,
-    # puis commission_partenaire en fallback (selon quelle table existe).
+    # ── 1. Clients ───────────────────────────────────────────────────
     if chambre_ids:
-        # commission_client n'existe pas encore en DB → on utilise uniquement
-        # commission_partenaire (table existante) pour le statut de paiement clients.
         sql_clients = """
             SELECT
                 r.id,
@@ -481,9 +478,7 @@ async def get_reservations_hotel(
                 date_reservation = c["date_reservation"],
             ))
 
-    # ── 2. Réservations VISITEURS ────────────────────────────────────
-    # CORRECTION : statut lu depuis commission_visiteur (LEFT JOIN)
-    # Avant : statut_paiement était toujours codé EN_ATTENTE en dur.
+    # ── 2. Visiteurs ─────────────────────────────────────────────────
     if chambre_ids:
         sql_visiteurs = """
             SELECT
@@ -543,20 +538,13 @@ async def get_reservations_hotel(
                 date_reservation = v["created_at"],
             ))
 
-    # ── Tri par date décroissante ──
     items.sort(key=lambda x: x.date_reservation, reverse=True)
-
-    # ── Pagination en mémoire ──
-    total  = len(items)
-    start  = (page - 1) * per_page
-    end    = start + per_page
-    paged  = items[start:end]
+    total = len(items)
+    start = (page - 1) * per_page
+    paged = items[start:start + per_page]
 
     return PartReservationListResponse(
-        total=total,
-        page=page,
-        per_page=per_page,
-        items=paged,
+        total=total, page=page, per_page=per_page, items=paged,
     )
 
 
@@ -586,21 +574,17 @@ async def get_paiements_recus(
 
     items = [
         PartPaiementItem(
-            id         = p.id,
-            montant    = float(p.montant),
-            note       = p.note,
-            created_at = p.created_at,
+            id             = p.id,
+            montant        = float(p.montant),
+            note           = p.note,
+            numero_facture = p.numero_facture,        # ✅
+            has_pdf        = p.pdf_data is not None,  # ✅
+            created_at     = p.created_at,
         )
         for p in rows
     ]
 
-    return PartPaiementsResponse(
-        total=total,
-        page=page,
-        per_page=per_page,
-        items=items,
-    )
-
+    return PartPaiementsResponse(total=total, page=page, per_page=per_page, items=items)
 
 # ═══════════════════════════════════════════════════════════
 #  DEMANDE DE RETRAIT
@@ -611,37 +595,77 @@ async def demander_retrait(
     req: PartDemandeRetraitRequest,
     session: AsyncSession,
 ) -> PartDemandeRetraitResponse:
-    # Vérification du solde disponible
     chambre_ids = await _get_chambre_ids_partenaire(id_partenaire, session)
-    rev_total   = (
-        await _revenu_clients(session, chambre_ids)
-        + await _revenu_visiteurs(session, chambre_ids)
-    )
-    part_totale  = round(rev_total * _PART_PARTENAIRE, 2)
-    deja_verse   = await _montant_deja_verse(id_partenaire, session)
-    solde_dispo  = max(0.0, round(part_totale - deja_verse, 2))
+    solde_dispo = await _calcul_solde(id_partenaire, chambre_ids, session)
 
     if req.montant <= 0:
         return PartDemandeRetraitResponse(
             success=False,
             message="Le montant doit être supérieur à 0.",
+            montant_demande=req.montant,
+            solde_disponible=solde_dispo,
         )
 
     if req.montant > solde_dispo:
         return PartDemandeRetraitResponse(
             success=False,
-            message=f"Montant demandé ({req.montant:.2f} DT) supérieur au solde disponible ({solde_dispo:.2f} DT).",
+            message=f"Montant ({req.montant:.2f} DT) supérieur au solde disponible ({solde_dispo:.2f} DT).",
+            montant_demande=req.montant,
+            solde_disponible=solde_dispo,
         )
 
-    note = f"DEMANDE_RETRAIT:{req.note or ''}"
-    session.add(PaiementPartenaire(
+    # ✅ INSERT dans withdraw_requests uniquement — pas dans paiement_partenaire
+    session.add(WithdrawRequest(
         id_partenaire=id_partenaire,
         montant=req.montant,
-        note=note,
+        note=req.note or None,
+        statut="EN_ATTENTE",
     ))
     await session.commit()
 
     return PartDemandeRetraitResponse(
         success=True,
-        message=f"Demande de retrait de {req.montant:.2f} DT envoyée à l'admin.",
+        message=f"Demande de {req.montant:.2f} DT envoyée. En attente de validation par l'admin.",
+        montant_demande=req.montant,
+        solde_disponible=round(solde_dispo - req.montant, 2),
     )
+
+
+# ═══════════════════════════════════════════════════════════
+#  MES DEMANDES DE RETRAIT (historique partenaire)
+# ═══════════════════════════════════════════════════════════
+
+async def get_mes_demandes(
+    id_partenaire: int,
+    session: AsyncSession,
+    page: int = 1,
+    per_page: int = 20,
+) -> PartDemandesResponse:
+    total_q = await session.execute(
+        select(func.count(WithdrawRequest.id))
+        .where(WithdrawRequest.id_partenaire == id_partenaire)
+    )
+    total = int(total_q.scalar_one() or 0)
+
+    rows = (await session.execute(
+        select(WithdrawRequest)
+        .where(WithdrawRequest.id_partenaire == id_partenaire)
+        .order_by(WithdrawRequest.created_at.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+    )).scalars().all()
+
+    items = [
+        PartDemandeItem(
+            id         = r.id,
+            montant    = float(r.montant),
+            note       = r.note,
+            statut     = r.statut,
+            note_admin = r.note_admin,
+            created_at = r.created_at,
+            updated_at = r.updated_at,
+        )
+        for r in rows
+    ]
+
+    return PartDemandesResponse(total=total, page=page, per_page=per_page, items=items)

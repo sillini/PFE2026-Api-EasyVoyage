@@ -2,7 +2,6 @@
 app/schemas/finances.py
 ========================
 Schémas Pydantic pour le module de gestion financière / comptabilité.
-Version avancée avec drill-down partenaire → hôtel → réservation.
 """
 from __future__ import annotations
 from datetime import datetime, date
@@ -65,21 +64,20 @@ class CommissionListResponse(BaseModel):
 
 
 class SoldePartenaire(BaseModel):
-    id_partenaire:     int
-    partenaire_nom:    str
-    partenaire_prenom: str
-    partenaire_email:  str
-    nom_entreprise:    str
-    solde_du:          float
-    # ── Champs enrichis ──────────────────────────────────
-    revenu_hotel:      float = 0.0   # revenu hôtel total (clients + visiteurs)
-    commission_agence: float = 0.0   # 10% du revenu hôtel
-    montant_paye:      float = 0.0   # déjà versé
-    nb_commissions:    int            # clients EN_ATTENTE dans commission_partenaire
-    nb_reservations_visiteurs: int = 0  # visiteurs confirmés/terminés
-    nb_reservations_total:     int = 0  # total = clients + visiteurs
- 
- 
+    id_partenaire:             int
+    partenaire_nom:            str
+    partenaire_prenom:         str
+    partenaire_email:          str
+    nom_entreprise:            str
+    solde_du:                  float
+    revenu_hotel:              float = 0.0
+    commission_agence:         float = 0.0
+    montant_paye:              float = 0.0
+    nb_commissions:            int
+    nb_reservations_visiteurs: int   = 0
+    nb_reservations_total:     int   = 0
+
+
 class SoldesPartenairesResponse(BaseModel):
     items: List[SoldePartenaire]
 
@@ -89,27 +87,29 @@ class PayerPartenaireRequest(BaseModel):
 
 
 class PayerPartenaireResponse(BaseModel):
+    success:       bool
     id_partenaire: int
     montant_paye:  float
     message:       str
-
+    nb_commissions: int = 0
 
 class PaiementHistoriqueItem(BaseModel):
-    # id supprimé — non affiché côté interface
+    id:                int          # ✅ nécessaire pour les actions PDF/email
     id_partenaire:     int
     partenaire_nom:    str
     partenaire_prenom: str
-    partenaire_email:  str                   # ← NOUVEAU
-    partenaire_tel:    Optional[str] = None  # ← NOUVEAU
-    nom_entreprise:    str = "—"             # ← NOUVEAU
+    partenaire_email:  str
+    partenaire_tel:    Optional[str] = None
+    nom_entreprise:    str = "—"
     montant:           float
     note:              Optional[str] = None
+    numero_facture:    Optional[str] = None   # ✅ NOUVEAU
+    has_pdf:           bool          = False  # ✅ NOUVEAU
     created_at:        datetime
- 
+
     class Config:
         from_attributes = True
- 
-
+        
 class PaiementHistoriqueResponse(BaseModel):
     total:    int
     page:     int
@@ -152,7 +152,6 @@ class FinanceDashboard(BaseModel):
     revenu_voyage_annee:       float
     nb_reservations_mois:      int
     nb_reservations_annee:     int
-    # ── Nouveaux champs ──────────────────────────────────
     total_part_partenaires:    float = 0.0
     total_commissions_agence:  float = 0.0
 
@@ -214,25 +213,22 @@ class HotelFinanceListResponse(BaseModel):
 # ═══════════════════════════════════════════════════════════
 
 class ReservationFinanceItem(BaseModel):
-    """
-    Réservation dans le drill-down hôtel — clients ET visiteurs.
-    client_email ajouté pour l'affichage et la recherche frontend.
-    """
     type_source:       str
     client_nom:        str
-    client_email:      Optional[str]  = None   # ← NOUVEAU
-    date_debut:        Optional[date]     = None
-    date_fin:          Optional[date]     = None
+    client_email:      Optional[str]  = None
+    date_debut:        Optional[date] = None
+    date_fin:          Optional[date] = None
     montant_total:     float
     commission_agence: float
     part_partenaire:   float
     taux_commission:   float
     statut_commission: str
     date_paiement:     Optional[datetime] = None
- 
+
     class Config:
         from_attributes = True
- 
+
+
 class ReservationFinanceListResponse(BaseModel):
     total:    int
     page:     int
@@ -241,7 +237,7 @@ class ReservationFinanceListResponse(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
-#  CLIENTS + VISITEURS — CLASSEMENT MULTI-CRITÈRES
+#  CLIENTS + VISITEURS — CLASSEMENT
 # ═══════════════════════════════════════════════════════════
 
 class ClientVisiteurItem(BaseModel):
@@ -260,3 +256,45 @@ class ClientsVisiteursRentabiliteResponse(BaseModel):
     total:   int
     critere: str
     items:   List[ClientVisiteurItem]
+
+
+# ═══════════════════════════════════════════════════════════
+#  DEMANDES DE RETRAIT — VUE ADMIN
+# ═══════════════════════════════════════════════════════════
+
+class DemandeRetraitItem(BaseModel):
+    id:                int
+    id_partenaire:     int
+    partenaire_nom:    str
+    partenaire_prenom: str
+    partenaire_email:  str
+    nom_entreprise:    str = "—"
+    montant:           float
+    note:              Optional[str] = None
+    statut:            str           # EN_ATTENTE | APPROUVEE | REFUSEE
+    note_admin:        Optional[str] = None
+    created_at:        datetime
+    updated_at:        Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class DemandesRetraitResponse(BaseModel):
+    total:    int
+    page:     int
+    per_page: int
+    items:    List[DemandeRetraitItem]
+
+
+class ValiderDemandeRequest(BaseModel):
+    note_admin: Optional[str] = None
+
+
+class RefuserDemandeRequest(BaseModel):
+    note_admin: Optional[str] = Field(None, description="Motif du refus")
+
+
+class DemandeActionResponse(BaseModel):
+    success: bool
+    message: str

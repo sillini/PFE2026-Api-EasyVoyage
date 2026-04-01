@@ -402,3 +402,108 @@ async def send_voucher_email(
     except Exception as exc:
         # Ne jamais crasher — la réservation est déjà confirmée en base
         print(f"[EMAIL VOUCHER] ❌ Échec envoi à '{to}': {exc}")
+
+
+
+
+async def send_paiement_partenaire_email(
+    to:             str,
+    prenom:         str,
+    nom:            str,
+    nom_entreprise: str,
+    numero_facture: str,
+    montant:        float,
+    date_paiement:  str,
+    note:           str,
+    pdf_bytes:      bytes,
+) -> None:
+    """
+    Envoie l'email de confirmation de paiement au partenaire
+    avec la facture PDF en pièce jointe.
+    Ne lève jamais d'exception.
+    """
+    note_ligne = f"""
+      <tr style="background:#FAFBFC;">
+        <td style="color:#8A9BB0;font-size:13px;padding:10px 18px;">Note</td>
+        <td style="font-size:13px;font-weight:600;color:#0F2235;text-align:right;padding:10px 18px;">{note}</td>
+      </tr>
+    """ if note else ""
+
+    html = f"""<!DOCTYPE html>
+<html><body style="margin:0;padding:0;background:#F0F4F8;font-family:'Segoe UI',sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0">
+  <tr><td align="center" style="padding:40px 20px;">
+    <table width="580" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.10);">
+
+      <!-- Header -->
+      <tr><td style="background:linear-gradient(135deg,#0F2235,#1A3F63);padding:32px 40px;text-align:center;">
+        <h1 style="color:#C4973A;font-size:28px;margin:0;letter-spacing:-0.5px;">EasyVoyage</h1>
+        <p style="color:rgba(255,255,255,.7);font-size:13px;margin:8px 0 0;">Espace Partenaire</p>
+      </td></tr>
+
+      <!-- Icône succès -->
+      <tr><td style="padding:32px 40px 16px;text-align:center;">
+        <div style="width:64px;height:64px;background:#D4EDDA;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;margin:0 auto;">
+          <span style="font-size:32px;">✓</span>
+        </div>
+        <h2 style="color:#1A3F63;font-size:20px;margin:16px 0 4px;">Paiement effectué avec succès</h2>
+        <p style="color:#7A8FA6;font-size:14px;margin:0;">Bonjour <strong>{prenom} {nom}</strong>, votre virement a bien été traité.</p>
+      </td></tr>
+
+      <!-- Détails paiement -->
+      <tr><td style="padding:16px 40px 32px;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #EDF2F7;border-radius:10px;overflow:hidden;">
+          <tr>
+            <td style="color:#8A9BB0;font-size:13px;padding:10px 18px;border-bottom:1px solid #F0F4F8;">N° Facture</td>
+            <td style="font-size:13px;font-weight:700;color:#1A3F63;text-align:right;padding:10px 18px;border-bottom:1px solid #F0F4F8;">{numero_facture}</td>
+          </tr>
+          <tr style="background:#FAFBFC;">
+            <td style="color:#8A9BB0;font-size:13px;padding:10px 18px;border-bottom:1px solid #F0F4F8;">Entreprise</td>
+            <td style="font-size:13px;font-weight:600;color:#0F2235;text-align:right;padding:10px 18px;border-bottom:1px solid #F0F4F8;">{nom_entreprise}</td>
+          </tr>
+          <tr>
+            <td style="color:#8A9BB0;font-size:13px;padding:10px 18px;border-bottom:1px solid #F0F4F8;">Date de paiement</td>
+            <td style="font-size:13px;font-weight:600;color:#0F2235;text-align:right;padding:10px 18px;border-bottom:1px solid #F0F4F8;">{date_paiement}</td>
+          </tr>
+          {note_ligne}
+          <tr style="background:#F0FBF4;">
+            <td style="color:#155724;font-size:14px;font-weight:700;padding:14px 18px;">Montant versé</td>
+            <td style="font-size:20px;font-weight:800;color:#27AE60;text-align:right;padding:14px 18px;">{montant:.2f} DT</td>
+          </tr>
+        </table>
+
+        <!-- Note PDF -->
+        <div style="margin:20px 0 0;background:#EBF4FF;border:1px solid rgba(26,63,99,0.2);border-radius:10px;padding:14px 18px;">
+          <p style="color:#1A3F63;font-size:13px;margin:0;line-height:1.5;">
+            📎 <strong>Votre reçu de paiement (PDF)</strong> est joint à cet email. Conservez-le pour vos archives.
+          </p>
+        </div>
+
+        <div style="text-align:center;margin-top:28px;">
+          <a href="http://localhost:3000" style="display:inline-block;background:linear-gradient(135deg,#0F2235,#1A3F63);color:white;text-decoration:none;padding:14px 36px;border-radius:10px;font-weight:bold;font-size:14px;">
+            Accéder à mon espace
+          </a>
+        </div>
+      </td></tr>
+
+      <!-- Footer -->
+      <tr><td style="background:#F8FAFC;padding:20px 40px;text-align:center;">
+        <p style="color:#B0BEC8;font-size:12px;margin:0;">EasyVoyage — Votre partenaire de confiance — Tunis, Tunisie</p>
+      </td></tr>
+
+    </table>
+  </td></tr>
+</table>
+</body></html>"""
+
+    pdf_filename = f"recu_paiement_{numero_facture}.pdf"
+    subject      = f"✅ Paiement reçu — {montant:.2f} DT — {numero_facture}"
+
+    try:
+        await asyncio.to_thread(
+            _send_voucher_sync, to, subject, html, pdf_bytes, pdf_filename
+        )
+        print(f"[EMAIL PAIEMENT] ✅ Envoyé à {to} — {numero_facture}")
+    except Exception as e:
+        print(f"[EMAIL PAIEMENT] ❌ ERREUR: {e}")
+        # Ne pas lever l'exception — le paiement est déjà validé

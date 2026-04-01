@@ -1,8 +1,3 @@
-"""
-app/services/finances/__init__.py
-==================================
-Package service financier — exports publics.
-"""
 from app.services.finances.service import (
     get_dashboard,
     get_revenus,
@@ -15,6 +10,9 @@ from app.services.finances.service import (
     get_clients_visiteurs_classement,
     list_commissions,
     sync_commission_reservation,
+    get_demandes_retrait,
+    valider_demande_retrait,
+    refuser_demande_retrait,
 )
 
 __all__ = [
@@ -29,4 +27,7 @@ __all__ = [
     "get_clients_visiteurs_classement",
     "list_commissions",
     "sync_commission_reservation",
+    "get_demandes_retrait",
+    "valider_demande_retrait",
+    "refuser_demande_retrait",
 ]

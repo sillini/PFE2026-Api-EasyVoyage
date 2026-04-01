@@ -10,19 +10,28 @@ Routes :
   GET  /finances/soldes-partenaires
   POST /finances/payer/{id}
   GET  /finances/paiements
+  GET  /finances/paiements/{id}/pdf
+  POST /finances/paiements/{id}/renvoyer-email
   GET  /finances/partenaires
   GET  /finances/partenaires/{id}/hotels
   GET  /finances/partenaires/{id}/hotels/{id}/reservations
   GET  /finances/classement-clients
+  GET  /finances/demandes-retrait
+  POST /finances/demandes-retrait/{id}/valider
+  POST /finances/demandes-retrait/{id}/refuser
 """
 from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dependencies import require_admin
 from app.db.session import get_db
+from app.models.finances import PaiementPartenaire
+from app.models.utilisateur import Utilisateur
 from app.schemas.auth import TokenData
 from app.schemas.finances import (
     FinanceDashboard,
@@ -36,6 +45,10 @@ from app.schemas.finances import (
     HotelFinanceListResponse,
     ReservationFinanceListResponse,
     ClientsVisiteursRentabiliteResponse,
+    DemandesRetraitResponse,
+    ValiderDemandeRequest,
+    RefuserDemandeRequest,
+    DemandeActionResponse,
 )
 import app.services.finances as svc
 
@@ -112,9 +125,9 @@ async def historique_paiements(
     id_partenaire: Optional[int]   = Query(None),
     date_debut:    Optional[date]  = Query(None),
     date_fin:      Optional[date]  = Query(None),
-    montant_min:   Optional[float] = Query(None, ge=0, description="Montant payé minimum"),
-    montant_max:   Optional[float] = Query(None, ge=0, description="Montant payé maximum"),
-    search:        Optional[str]   = Query(None,        description="Recherche nom/email/entreprise/note"),
+    montant_min:   Optional[float] = Query(None, ge=0),
+    montant_max:   Optional[float] = Query(None, ge=0),
+    search:        Optional[str]   = Query(None),
     page:          int             = Query(1,  ge=1),
     per_page:      int             = Query(20, ge=1, le=100),
     session: AsyncSession          = Depends(get_db),
@@ -131,6 +144,77 @@ async def historique_paiements(
         page=page,
         per_page=per_page,
     )
+
+
+# ── Télécharger facture PDF d'un paiement ─────────────────
+@router.get("/paiements/{paiement_id}/pdf",
+            summary="Télécharger la facture d'un paiement partenaire [ADMIN]")
+async def telecharger_facture_paiement_admin(
+    paiement_id: int,
+    session: AsyncSession = Depends(get_db),
+    _: TokenData          = Depends(require_admin),
+):
+    p = (await session.execute(
+        select(PaiementPartenaire).where(PaiementPartenaire.id == paiement_id)
+    )).scalar_one_or_none()
+
+    if not p:
+        raise HTTPException(status_code=404, detail="Paiement introuvable")
+    if not p.pdf_data:
+        raise HTTPException(status_code=404, detail="Aucune facture PDF disponible pour ce paiement")
+
+    filename = f"{p.numero_facture}.pdf" if p.numero_facture else f"facture_{paiement_id}.pdf"
+    return Response(
+        content=bytes(p.pdf_data),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ── Renvoyer email de paiement ────────────────────────────
+@router.post("/paiements/{paiement_id}/renvoyer-email",
+             summary="Renvoyer l'email de paiement au partenaire [ADMIN]")
+async def renvoyer_email_paiement(
+    paiement_id: int,
+    session: AsyncSession = Depends(get_db),
+    _: TokenData          = Depends(require_admin),
+):
+    from app.models.utilisateur import Partenaire as PartenaireModel
+    from app.services.email_service import send_paiement_partenaire_email
+
+    p = (await session.execute(
+        select(PaiementPartenaire).where(PaiementPartenaire.id == paiement_id)
+    )).scalar_one_or_none()
+
+    if not p:
+        raise HTTPException(status_code=404, detail="Paiement introuvable")
+    if not p.pdf_data:
+        raise HTTPException(status_code=404, detail="Aucune facture PDF disponible")
+
+    usr = (await session.execute(
+        select(Utilisateur).where(Utilisateur.id == p.id_partenaire)
+    )).scalar_one_or_none()
+
+    part = (await session.execute(
+        select(PartenaireModel).where(PartenaireModel.id == p.id_partenaire)
+    )).scalar_one_or_none()
+
+    if not usr or not usr.email:
+        raise HTTPException(status_code=400, detail="Email partenaire introuvable")
+
+    await send_paiement_partenaire_email(
+        to             = usr.email,
+        prenom         = usr.prenom or "",
+        nom            = usr.nom    or "",
+        nom_entreprise = part.nom_entreprise if part else "—",
+        numero_facture = p.numero_facture or f"PAY-{p.id}",
+        montant        = float(p.montant),
+        date_paiement  = p.created_at.strftime("%d/%m/%Y") if p.created_at else "—",
+        note           = p.note or "",
+        pdf_bytes      = bytes(p.pdf_data),
+    )
+
+    return {"success": True, "message": f"Email renvoyé à {usr.email}"}
 
 
 # ── Partenaires avec KPIs financiers ─────────────────────
@@ -169,7 +253,7 @@ async def reservations_hotel(
     id_hotel:          int,
     statut_commission: Optional[str] = Query(None, description="EN_ATTENTE | PAYEE"),
     page:              int           = Query(1,   ge=1),
-    per_page:          int           = Query(20,  ge=1, le=1000),  # ← 100 → 1000 : chargement complet pour filtrage frontend
+    per_page:          int           = Query(20,  ge=1, le=1000),
     session: AsyncSession            = Depends(get_db),
     _: TokenData                     = Depends(require_admin),
 ) -> ReservationFinanceListResponse:
@@ -184,12 +268,47 @@ async def reservations_hotel(
 @router.get("/classement-clients", response_model=ClientsVisiteursRentabiliteResponse,
             summary="Classement clients et visiteurs [ADMIN]")
 async def classement_clients(
-    critere: str = Query(
-        "depenses",
-        description="depenses | commissions | nb_hotel | nb_voyage | nb_reservations",
-    ),
-    limit:   int          = Query(50, ge=1, le=200),
+    critere: str = Query("depenses"),
+    limit:   int = Query(50, ge=1, le=200),
     session: AsyncSession = Depends(get_db),
     _: TokenData          = Depends(require_admin),
 ) -> ClientsVisiteursRentabiliteResponse:
     return await svc.get_clients_visiteurs_classement(session, critere=critere, limit=limit)
+
+
+# ── Demandes de retrait ───────────────────────────────────
+@router.get("/demandes-retrait", response_model=DemandesRetraitResponse,
+            summary="Liste des demandes de retrait partenaires [ADMIN]")
+async def demandes_retrait(
+    statut:        Optional[str] = Query(None, description="EN_ATTENTE | APPROUVEE | REFUSEE"),
+    id_partenaire: Optional[int] = Query(None),
+    page:          int           = Query(1,  ge=1),
+    per_page:      int           = Query(20, ge=1, le=100),
+    session: AsyncSession        = Depends(get_db),
+    _: TokenData                 = Depends(require_admin),
+) -> DemandesRetraitResponse:
+    return await svc.get_demandes_retrait(session, statut, id_partenaire, page, per_page)
+
+
+@router.post("/demandes-retrait/{demande_id}/valider",
+             response_model=DemandeActionResponse,
+             summary="Valider une demande de retrait [ADMIN]")
+async def valider_demande(
+    demande_id: int,
+    body:    ValiderDemandeRequest = ValiderDemandeRequest(),
+    session: AsyncSession          = Depends(get_db),
+    _: TokenData                   = Depends(require_admin),
+) -> DemandeActionResponse:
+    return await svc.valider_demande_retrait(demande_id, body.note_admin, session)
+
+
+@router.post("/demandes-retrait/{demande_id}/refuser",
+             response_model=DemandeActionResponse,
+             summary="Refuser une demande de retrait [ADMIN]")
+async def refuser_demande(
+    demande_id: int,
+    body:    RefuserDemandeRequest = RefuserDemandeRequest(),
+    session: AsyncSession          = Depends(get_db),
+    _: TokenData                   = Depends(require_admin),
+) -> DemandeActionResponse:
+    return await svc.refuser_demande_retrait(demande_id, body.note_admin, session)

@@ -309,3 +309,154 @@ def generer_facture_pdf(
 
     doc.build(elements)
     return buffer.getvalue()
+
+
+def generer_facture_paiement_partenaire(
+    *,
+    numero_facture:   str,
+    date_paiement:    datetime,
+    # Partenaire
+    partenaire_nom:   str,
+    partenaire_prenom: str,
+    partenaire_email: str,
+    partenaire_tel:   str = "—",
+    nom_entreprise:   str = "—",
+    # Paiement
+    montant:          float,
+    note:             str = "",
+    # Agence
+    agence_nom:     str = "EasyVoyage",
+    agence_slogan:  str = "Votre partenaire de voyage de confiance",
+    agence_adresse: str = "Tunis, Tunisie",
+    agence_email:   str = "contact@easyvoyage.com",
+    agence_tel:     str = "+216 XX XXX XXX",
+) -> bytes:
+    """Génère la facture PDF d'un paiement partenaire et retourne les bytes."""
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=2 * cm, rightMargin=2 * cm,
+        topMargin=2 * cm,  bottomMargin=2 * cm,
+        title=f"Facture {numero_facture}",
+        author=agence_nom,
+    )
+
+    styles   = _get_styles()
+    elements = []
+    largeur  = doc.width
+
+    # ── En-tête ───────────────────────────────────────────
+    entete_data = [[
+        [
+            Paragraph(agence_nom,    styles["AgenceNom"]),
+            Paragraph(agence_slogan, styles["AgenceSlogan"]),
+            Spacer(1, 4),
+            Paragraph(agence_adresse, styles["AgenceSlogan"]),
+            Paragraph(agence_email,   styles["AgenceSlogan"]),
+            Paragraph(agence_tel,     styles["AgenceSlogan"]),
+        ],
+        [
+            Paragraph("REÇU DE PAIEMENT", styles["TitreFacture"]),
+            Paragraph(f"N° <b>{numero_facture}</b>", styles["NumeroFacture"]),
+            Spacer(1, 6),
+            Paragraph(
+                f"Date : <b>{date_paiement.strftime('%d/%m/%Y')}</b>",
+                styles["InfoValue"]
+            ),
+            Paragraph("Statut : <b>PAYÉ</b>", styles["InfoValue"]),
+        ],
+    ]]
+    entete_table = Table(entete_data, colWidths=[largeur * 0.55, largeur * 0.45])
+    entete_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ALIGN",  (1, 0), (1, 0),  "RIGHT"),
+    ]))
+    elements.append(entete_table)
+    elements.append(Spacer(1, 0.3 * cm))
+    elements.append(HRFlowable(width="100%", thickness=2, color=BLEU_AGENCE))
+    elements.append(Spacer(1, 0.4 * cm))
+
+    # ── Informations partenaire ───────────────────────────
+    elements.append(Paragraph("Bénéficiaire", styles["SectionTitre"]))
+    part_data = [
+        ["Nom complet",  f"{partenaire_prenom} {partenaire_nom}"],
+        ["Email",        partenaire_email],
+        ["Téléphone",    partenaire_tel],
+        ["Entreprise",   nom_entreprise],
+    ]
+    part_table = Table(part_data, colWidths=[largeur * 0.25, largeur * 0.75])
+    part_table.setStyle(TableStyle([
+        ("FONTNAME",       (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME",       (1, 0), (1, -1), "Helvetica"),
+        ("FONTSIZE",       (0, 0), (-1, -1), 9),
+        ("TEXTCOLOR",      (0, 0), (0, -1), GRIS_TEXTE),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, GRIS_LEGER]),
+        ("TOPPADDING",     (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING",  (0, 0), (-1, -1), 5),
+        ("LEFTPADDING",    (0, 0), (-1, -1), 8),
+        ("GRID",           (0, 0), (-1, -1), 0.3, colors.HexColor("#DDDDDD")),
+    ]))
+    elements.append(part_table)
+    elements.append(Spacer(1, 0.5 * cm))
+
+    # ── Détail du paiement ────────────────────────────────
+    elements.append(Paragraph("Détail du paiement", styles["SectionTitre"]))
+    presta_header = [["Description", "Montant (DT)"]]
+    presta_rows   = [["Virement partenaire — commission sur réservations hôtelières",
+                       f"{montant:.2f}"]]
+    if note:
+        presta_rows.append([f"Note : {note}", ""])
+
+    presta_data = presta_header + presta_rows
+    presta_table = Table(presta_data, colWidths=[largeur * 0.75, largeur * 0.25])
+    presta_table.setStyle(TableStyle([
+        ("BACKGROUND",  (0, 0), (-1, 0),  BLEU_AGENCE),
+        ("TEXTCOLOR",   (0, 0), (-1, 0),  colors.white),
+        ("FONTNAME",    (0, 0), (-1, 0),  "Helvetica-Bold"),
+        ("FONTSIZE",    (0, 0), (-1, -1), 9),
+        ("ALIGN",       (1, 0), (1, -1),  "RIGHT"),
+        ("FONTNAME",    (0, 1), (-1, -1), "Helvetica"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, GRIS_LEGER]),
+        ("TOPPADDING",  (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 7),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING",(0, 0), (-1, -1), 8),
+        ("GRID",        (0, 0), (-1, -1), 0.3, colors.HexColor("#DDDDDD")),
+    ]))
+    elements.append(presta_table)
+    elements.append(Spacer(1, 0.5 * cm))
+
+    # ── Total ─────────────────────────────────────────────
+    recap_data = [
+        ["", "TOTAL VERSÉ", f"{montant:.2f} DT"],
+    ]
+    recap_table = Table(recap_data, colWidths=[largeur * 0.55, largeur * 0.25, largeur * 0.20])
+    recap_table.setStyle(TableStyle([
+        ("FONTNAME",      (1, 0), (2, 0),  "Helvetica-Bold"),
+        ("FONTSIZE",      (1, 0), (2, 0),  12),
+        ("TEXTCOLOR",     (1, 0), (2, 0),  VERT_TOTAL),
+        ("ALIGN",         (1, 0), (-1, -1), "RIGHT"),
+        ("TOPPADDING",    (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("LINEABOVE",     (1, 0), (2, 0),  1.5, VERT_TOTAL),
+        ("BACKGROUND",    (1, 0), (2, 0),  colors.HexColor("#EAFAF1")),
+    ]))
+    elements.append(recap_table)
+    elements.append(Spacer(1, 1 * cm))
+
+    # ── Pied de page ──────────────────────────────────────
+    elements.append(HRFlowable(width="100%", thickness=0.5, color=GRIS_TEXTE))
+    elements.append(Spacer(1, 0.2 * cm))
+    elements.append(Paragraph(
+        f"{agence_nom} — {agence_adresse} — {agence_email} — {agence_tel}",
+        styles["PiedPage"]
+    ))
+    elements.append(Paragraph(
+        "Ce document tient lieu de reçu de paiement officiel. Merci pour votre confiance.",
+        styles["PiedPage"]
+    ))
+
+    doc.build(elements)
+    return buffer.getvalue()
