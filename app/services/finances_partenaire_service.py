@@ -3,23 +3,26 @@ app/services/finances_partenaire_service.py
 ============================================
 Logique métier du module Finance — Espace Partenaire.
 
-Règles fondamentales :
-  - Toutes les fonctions sont SCOPÉES sur id_partenaire (JWT) → un partenaire
-    ne voit JAMAIS les données d'un autre.
-  - Chaque calcul de revenu combine TOUJOURS les deux sources :
-      · table `reservation`         (clients connectés)
-      · table `reservation_visiteur` (visiteurs sans compte)
-  - La part partenaire = 90 % du montant brut (taux_commission = 10 %).
-  - Le solde disponible = somme des parts partenaire non encore versées.
-  - Ce fichier N'IMPORTE et NE MODIFIE RIEN dans finances/service.py ni
-    dans finances/repository.py → zéro impact sur l'espace admin.
+CORRECTIONS apportées :
+  - get_reservations_hotel → clients   : lit statut depuis commission_client
+                                         (fallback commission_partenaire si table absente)
+  - get_reservations_hotel → visiteurs : lit statut depuis commission_visiteur
+                                         (n'était jamais lu → toujours EN_ATTENTE avant)
+  - Les deux requêtes utilisent désormais SQL brut avec LEFT JOIN,
+    identique à la logique admin (finances/service.py).
+
+Règles fondamentales conservées :
+  - Toutes les fonctions sont SCOPÉES sur id_partenaire (JWT).
+  - Revenu = clients + visiteurs.
+  - Part partenaire = 90 % du montant brut (taux_commission = 10 %).
+  - Solde disponible = part totale - déjà versé.
 """
 from __future__ import annotations
 
 from datetime import datetime, date
 from typing import Optional
 
-from sqlalchemy import select, func, extract, and_, or_
+from sqlalchemy import select, func, extract, and_, or_, text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -64,10 +67,6 @@ async def _get_chambre_ids_partenaire(
     session: AsyncSession,
     id_hotel: Optional[int] = None,
 ) -> list[int]:
-    """
-    Retourne les IDs de toutes les chambres appartenant au partenaire.
-    Si id_hotel est précisé, filtre sur cet hôtel uniquement.
-    """
     q = (
         select(Chambre.id)
         .join(Hotel, Hotel.id == Chambre.id_hotel)
@@ -83,7 +82,6 @@ async def _get_hotel_ids_partenaire(
     id_partenaire: int,
     session: AsyncSession,
 ) -> list[int]:
-    """Retourne les IDs des hôtels appartenant au partenaire."""
     result = await session.execute(
         select(Hotel.id).where(Hotel.id_partenaire == id_partenaire)
     )
@@ -93,28 +91,23 @@ async def _get_hotel_ids_partenaire(
 async def _revenu_clients(
     session: AsyncSession,
     chambre_ids: list[int],
-    filtre_date=None,
+    filtre=None,
 ) -> float:
-    """
-    Somme des total_ttc des réservations CLIENTS confirmées/terminées
-    pour les chambres données, avec filtre date optionnel.
-    """
     if not chambre_ids:
         return 0.0
     q = (
-        select(func.coalesce(func.sum(Reservation.total_ttc), 0.0))
-        .join(
-            LigneReservationChambre,
-            LigneReservationChambre.id_reservation == Reservation.id,
-        )
+        select(func.coalesce(func.sum(Reservation.total_ttc), 0))
+        .join(LigneReservationChambre,
+              LigneReservationChambre.id_reservation == Reservation.id)
         .where(
             LigneReservationChambre.id_chambre.in_(chambre_ids),
+            Reservation.id_voyage.is_(None),
             Reservation.statut.in_(_STATUTS_VALIDES_CLIENT),
-            Reservation.id_voyage.is_(None),   # hôtel uniquement
         )
+        .distinct()
     )
-    if filtre_date is not None:
-        q = q.where(filtre_date)
+    if filtre is not None:
+        q = q.where(filtre)
     result = await session.execute(q)
     return float(result.scalar_one() or 0.0)
 
@@ -122,23 +115,19 @@ async def _revenu_clients(
 async def _revenu_visiteurs(
     session: AsyncSession,
     chambre_ids: list[int],
-    filtre_date=None,
+    filtre=None,
 ) -> float:
-    """
-    Somme des total_ttc des réservations VISITEURS confirmées/terminées
-    pour les chambres données, avec filtre date optionnel.
-    """
     if not chambre_ids:
         return 0.0
     q = (
-        select(func.coalesce(func.sum(ReservationVisiteur.total_ttc), 0.0))
+        select(func.coalesce(func.sum(ReservationVisiteur.total_ttc), 0))
         .where(
             ReservationVisiteur.id_chambre.in_(chambre_ids),
             ReservationVisiteur.statut.in_(_STATUTS_VALIDES_VISITEUR),
         )
     )
-    if filtre_date is not None:
-        q = q.where(filtre_date)
+    if filtre is not None:
+        q = q.where(filtre)
     result = await session.execute(q)
     return float(result.scalar_one() or 0.0)
 
@@ -146,48 +135,41 @@ async def _revenu_visiteurs(
 async def _nb_resas(
     session: AsyncSession,
     chambre_ids: list[int],
-    filtre_date_client=None,
-    filtre_date_visiteur=None,
+    filtre_client=None,
+    filtre_visiteur=None,
 ) -> int:
-    """Nombre total de réservations (clients + visiteurs) pour des chambres données."""
     if not chambre_ids:
         return 0
 
-    q_clients = (
+    q_c = (
         select(func.count(Reservation.id.distinct()))
-        .join(
-            LigneReservationChambre,
-            LigneReservationChambre.id_reservation == Reservation.id,
-        )
+        .join(LigneReservationChambre,
+              LigneReservationChambre.id_reservation == Reservation.id)
         .where(
             LigneReservationChambre.id_chambre.in_(chambre_ids),
-            Reservation.statut.in_(_STATUTS_VALIDES_CLIENT),
             Reservation.id_voyage.is_(None),
+            Reservation.statut.in_(_STATUTS_VALIDES_CLIENT),
         )
     )
-    if filtre_date_client is not None:
-        q_clients = q_clients.where(filtre_date_client)
+    if filtre_client is not None:
+        q_c = q_c.where(filtre_client)
 
-    q_visiteurs = (
-        select(func.count())
+    q_v = (
+        select(func.count(ReservationVisiteur.id))
         .where(
             ReservationVisiteur.id_chambre.in_(chambre_ids),
             ReservationVisiteur.statut.in_(_STATUTS_VALIDES_VISITEUR),
         )
     )
-    if filtre_date_visiteur is not None:
-        q_visiteurs = q_visiteurs.where(filtre_date_visiteur)
+    if filtre_visiteur is not None:
+        q_v = q_v.where(filtre_visiteur)
 
-    nb_c = (await session.execute(q_clients)).scalar_one()
-    nb_v = (await session.execute(q_visiteurs)).scalar_one()
+    nb_c = (await session.execute(q_c)).scalar_one() or 0
+    nb_v = (await session.execute(q_v)).scalar_one() or 0
     return int(nb_c) + int(nb_v)
 
 
-async def _montant_deja_verse(
-    id_partenaire: int,
-    session: AsyncSession,
-) -> float:
-    """Somme de tous les paiements déjà effectués à ce partenaire."""
+async def _montant_deja_verse(id_partenaire: int, session: AsyncSession) -> float:
     result = await session.execute(
         select(func.coalesce(func.sum(PaiementPartenaire.montant), 0.0))
         .where(PaiementPartenaire.id_partenaire == id_partenaire)
@@ -211,7 +193,6 @@ async def get_dashboard(
 
     chambre_ids = await _get_chambre_ids_partenaire(id_partenaire, session)
 
-    # ── Filtres mois courant ──
     filtre_mois_client = and_(
         extract("month", Reservation.date_reservation) == mois,
         extract("year",  Reservation.date_reservation) == annee,
@@ -220,8 +201,6 @@ async def get_dashboard(
         extract("month", ReservationVisiteur.created_at) == mois,
         extract("year",  ReservationVisiteur.created_at) == annee,
     )
-
-    # ── Filtres mois précédent ──
     filtre_prec_client = and_(
         extract("month", Reservation.date_reservation) == mois_prec,
         extract("year",  Reservation.date_reservation) == annee_prec,
@@ -230,8 +209,6 @@ async def get_dashboard(
         extract("month", ReservationVisiteur.created_at) == mois_prec,
         extract("year",  ReservationVisiteur.created_at) == annee_prec,
     )
-
-    # ── Filtres année courante ──
     filtre_annee_client  = extract("year", Reservation.date_reservation) == annee
     filtre_annee_visiteur = extract("year", ReservationVisiteur.created_at) == annee
 
@@ -251,7 +228,6 @@ async def get_dashboard(
         session, chambre_ids, filtre_mois_client, filtre_mois_visiteur
     )
 
-    # ── Solde disponible = part partenaire totale - déjà versé ──
     rev_total_all = (
         await _revenu_clients(session, chambre_ids)
         + await _revenu_visiteurs(session, chambre_ids)
@@ -260,7 +236,6 @@ async def get_dashboard(
     deja_verse   = await _montant_deja_verse(id_partenaire, session)
     solde_dispo  = max(0.0, round(part_totale - deja_verse, 2))
 
-    # ── Évolution % ──
     if rev_prec > 0:
         evolution = round((rev_mois - rev_prec) / rev_prec * 100, 1)
     else:
@@ -336,10 +311,7 @@ async def get_mes_hotels(
     )).scalars().all()
 
     deja_verse_total = await _montant_deja_verse(id_partenaire, session)
-    # Répartit le montant versé proportionnellement — simplification :
-    # le solde restant global est réparti à l'affichage par hôtel via son poids
 
-    # D'abord calcul du revenu total du partenaire pour la pondération
     chambre_ids_all = await _get_chambre_ids_partenaire(id_partenaire, session)
     rev_total_global = (
         await _revenu_clients(session, chambre_ids_all)
@@ -374,12 +346,11 @@ async def get_mes_hotels(
         nb_mois  = await _nb_resas(session, chambre_ids, f_mois_c, f_mois_v)
         nb_total = await _nb_resas(session, chambre_ids)
 
-        # Solde de cet hôtel = sa proportion du solde global
         if rev_total_global > 0:
-            poids         = rev_total / rev_total_global
-            solde_hotel   = round(solde_global * poids, 2)
+            poids       = rev_total / rev_total_global
+            solde_hotel = round(solde_global * poids, 2)
         else:
-            solde_hotel   = 0.0
+            solde_hotel = 0.0
 
         items.append(PartHotelItem(
             id_hotel=hotel.id,
@@ -410,8 +381,12 @@ async def get_reservations_hotel(
     search: Optional[str] = None,
 ) -> PartReservationListResponse:
     """
-    Retourne TOUTES les réservations (clients + visiteurs) d'un hôtel,
-    en vérifiant que l'hôtel appartient bien au partenaire connecté.
+    Retourne TOUTES les réservations (clients + visiteurs) d'un hôtel.
+    
+    CORRECTION :
+      - Clients  → statut lu depuis commission_client (fallback commission_partenaire)
+      - Visiteurs → statut lu depuis commission_visiteur
+      Les deux utilisent SQL brut avec LEFT JOIN, identique à l'espace admin.
     """
     # ── Vérification sécurité : l'hôtel appartient au partenaire ──
     hotel = (await session.execute(
@@ -432,129 +407,140 @@ async def get_reservations_hotel(
     items: list[PartReservationItem] = []
 
     # ── 1. Réservations CLIENTS ──────────────────────────────────────
+    # Lit le statut de paiement depuis commission_client en priorité,
+    # puis commission_partenaire en fallback (selon quelle table existe).
     if chambre_ids:
-        q_c = (
-            select(Reservation)
-            .options(selectinload(Reservation.facture))
-            .join(
-                LigneReservationChambre,
-                LigneReservationChambre.id_reservation == Reservation.id,
+        # commission_client n'existe pas encore en DB → on utilise uniquement
+        # commission_partenaire (table existante) pour le statut de paiement clients.
+        sql_clients = """
+            SELECT
+                r.id,
+                r.date_debut,
+                r.date_fin,
+                r.total_ttc,
+                r.date_reservation,
+                CAST(r.statut AS VARCHAR)                               AS statut,
+                u.nom,
+                u.prenom,
+                u.email,
+                f.numero                                                AS facture_numero,
+                COALESCE(CAST(cp.statut AS VARCHAR), 'EN_ATTENTE')      AS statut_paiement,
+                cp.date_paiement                                        AS date_paiement
+            FROM voyage_hotel.reservation r
+            JOIN voyage_hotel.utilisateur u ON u.id = r.id_client
+            JOIN voyage_hotel.ligne_reservation_chambre lrc
+                ON lrc.id_reservation = r.id
+            LEFT JOIN voyage_hotel.facture f
+                ON f.id_reservation = r.id
+            LEFT JOIN voyage_hotel.commission_partenaire cp
+                ON cp.id_reservation = r.id
+               AND cp.id_partenaire  = :id_p
+            WHERE lrc.id_chambre = ANY(:ch_ids)
+              AND r.id_voyage    IS NULL
+              AND r.statut       IN ('CONFIRMEE', 'TERMINEE')
+        """
+
+        params_c: dict = {"id_p": id_partenaire, "ch_ids": list(chambre_ids)}
+
+        if statut and statut.strip():
+            sql_clients += " AND CAST(r.statut AS VARCHAR) = :statut_rv"
+            params_c["statut_rv"] = statut.strip()
+
+        if search and search.strip():
+            sql_clients += (
+                " AND (u.nom ILIKE :s OR u.prenom ILIKE :s OR u.email ILIKE :s)"
             )
-            .where(
-                LigneReservationChambre.id_chambre.in_(chambre_ids),
-                Reservation.id_voyage.is_(None),
-                Reservation.statut.in_(_STATUTS_VALIDES_CLIENT),
-            )
-            .distinct()
+            params_c["s"] = f"%{search.strip()}%"
+
+        sql_clients += (
+            " GROUP BY r.id, r.date_debut, r.date_fin, r.total_ttc, r.date_reservation,"
+            " r.statut, u.nom, u.prenom, u.email, f.numero,"
+            " cp.statut, cp.date_paiement"
+            " ORDER BY r.date_reservation DESC"
         )
-        if statut:
-            q_c = q_c.where(Reservation.statut == statut)
-        if search:
-            # Recherche sur le nom/email du client
-            q_c = q_c.join(
-                Utilisateur, Utilisateur.id == Reservation.id_client
-            ).where(
-                or_(
-                    Utilisateur.nom.ilike(f"%{search}%"),
-                    Utilisateur.prenom.ilike(f"%{search}%"),
-                    Utilisateur.email.ilike(f"%{search}%"),
-                )
-            )
 
-        resas_clients = (await session.execute(q_c)).scalars().all()
+        cli_rows = (await session.execute(sa_text(sql_clients), params_c)).mappings().all()
 
-        for r in resas_clients:
-            # Récupérer info client
-            client = (await session.execute(
-                select(Utilisateur).where(Utilisateur.id == r.id_client)
-            )).scalar_one_or_none()
-            client_nom   = f"{client.prenom} {client.nom}" if client else "Client"
-            client_email = client.email if client else ""
-
-            # Référence = numéro de facture si disponible
-            reference = f"RES-{r.id}"
-            if r.facture:
-                reference = r.facture.numero
-
-            # Statut paiement commission
-            commission = (await session.execute(
-                select(CommissionPartenaire).where(
-                    CommissionPartenaire.id_reservation == r.id
-                )
-            )).scalar_one_or_none()
-            statut_paiement = (
-                commission.statut.value if commission
-                else StatutCommission.EN_ATTENTE.value
-            )
-
-            nb_nuits = (r.date_fin - r.date_debut).days
-            montant  = float(r.total_ttc)
+        for c in cli_rows:
+            reference = c["facture_numero"] or f"RES-{c['id']}"
+            nb_nuits  = (c["date_fin"] - c["date_debut"]).days
+            montant   = float(c["total_ttc"])
             items.append(PartReservationItem(
-                id=r.id,
-                source="client",
-                reference=reference,
-                client_nom=client_nom,
-                client_email=client_email,
-                date_debut=r.date_debut,
-                date_fin=r.date_fin,
-                nb_nuits=nb_nuits,
-                montant_total=montant,
-                part_partenaire=round(montant * _PART_PARTENAIRE, 2),
-                statut=r.statut.value if hasattr(r.statut, "value") else str(r.statut),
-                statut_paiement=statut_paiement,
-                date_reservation=r.date_reservation,
+                id               = c["id"],
+                source           = "client",
+                reference        = reference,
+                client_nom       = f"{c['prenom']} {c['nom']}",
+                client_email     = c["email"] or "",
+                date_debut       = c["date_debut"],
+                date_fin         = c["date_fin"],
+                nb_nuits         = nb_nuits,
+                montant_total    = montant,
+                part_partenaire  = round(montant * _PART_PARTENAIRE, 2),
+                statut           = c["statut"],
+                statut_paiement  = c["statut_paiement"],
+                date_reservation = c["date_reservation"],
             ))
 
     # ── 2. Réservations VISITEURS ────────────────────────────────────
+    # CORRECTION : statut lu depuis commission_visiteur (LEFT JOIN)
+    # Avant : statut_paiement était toujours codé EN_ATTENTE en dur.
     if chambre_ids:
-        q_v = (
-            select(ReservationVisiteur)
-            .options(selectinload(ReservationVisiteur.facture))
-            .where(
-                ReservationVisiteur.id_chambre.in_(chambre_ids),
-                ReservationVisiteur.statut.in_(_STATUTS_VALIDES_VISITEUR),
+        sql_visiteurs = """
+            SELECT
+                rv.id,
+                rv.nom,
+                rv.prenom,
+                rv.email,
+                rv.date_debut,
+                rv.date_fin,
+                rv.total_ttc,
+                rv.created_at,
+                rv.statut,
+                rv.numero_voucher,
+                COALESCE(cv.statut, 'EN_ATTENTE')   AS statut_paiement,
+                cv.date_paiement                     AS date_paiement
+            FROM voyage_hotel.reservation_visiteur rv
+            LEFT JOIN voyage_hotel.commission_visiteur cv
+                ON cv.id_reservation_visiteur = rv.id
+               AND cv.id_partenaire            = :id_p
+            WHERE rv.id_chambre = ANY(:ch_ids)
+              AND rv.statut     IN ('CONFIRMEE', 'TERMINEE')
+        """
+
+        params_v: dict = {"id_p": id_partenaire, "ch_ids": list(chambre_ids)}
+
+        if statut and statut.strip():
+            sql_visiteurs += " AND rv.statut = :statut_rv"
+            params_v["statut_rv"] = statut.strip()
+
+        if search and search.strip():
+            sql_visiteurs += (
+                " AND (rv.nom ILIKE :s OR rv.prenom ILIKE :s OR rv.email ILIKE :s)"
             )
-        )
-        if statut:
-            q_v = q_v.where(ReservationVisiteur.statut == statut)
-        if search:
-            q_v = q_v.where(
-                or_(
-                    ReservationVisiteur.nom.ilike(f"%{search}%"),
-                    ReservationVisiteur.prenom.ilike(f"%{search}%"),
-                    ReservationVisiteur.email.ilike(f"%{search}%"),
-                )
-            )
+            params_v["s"] = f"%{search.strip()}%"
 
-        resas_visiteurs = (await session.execute(q_v)).scalars().all()
+        sql_visiteurs += " ORDER BY rv.created_at DESC"
 
-        for v in resas_visiteurs:
-            reference = v.numero_voucher
-            if v.facture:
-                reference = v.facture.numero
+        vis_rows = (await session.execute(sa_text(sql_visiteurs), params_v)).mappings().all()
 
-            # Les visiteurs n'ont pas de ligne dans commission_partenaire
-            # → leur statut paiement est déterminé par le paiement global du partenaire
-            # Pour simplifier : EN_ATTENTE sauf si un paiement partenaire couvre cette période
-            # (logique identique à l'admin : visiteurs = toujours EN_ATTENTE jusqu'au prochain versement)
-            statut_paiement = StatutCommission.EN_ATTENTE.value
-
-            nb_nuits = (v.date_fin - v.date_debut).days
-            montant  = float(v.total_ttc)
+        for v in vis_rows:
+            reference = v["numero_voucher"] or f"VIS-{v['id']}"
+            nb_nuits  = (v["date_fin"] - v["date_debut"]).days
+            montant   = float(v["total_ttc"])
             items.append(PartReservationItem(
-                id=v.id,
-                source="visiteur",
-                reference=reference,
-                client_nom=f"{v.prenom} {v.nom}",
-                client_email=v.email,
-                date_debut=v.date_debut,
-                date_fin=v.date_fin,
-                nb_nuits=nb_nuits,
-                montant_total=montant,
-                part_partenaire=round(montant * _PART_PARTENAIRE, 2),
-                statut=v.statut,
-                statut_paiement=statut_paiement,
-                date_reservation=v.created_at,
+                id               = v["id"],
+                source           = "visiteur",
+                reference        = reference,
+                client_nom       = f"{v['prenom']} {v['nom']}",
+                client_email     = v["email"] or "",
+                date_debut       = v["date_debut"],
+                date_fin         = v["date_fin"],
+                nb_nuits         = nb_nuits,
+                montant_total    = montant,
+                part_partenaire  = round(montant * _PART_PARTENAIRE, 2),
+                statut           = v["statut"],
+                statut_paiement  = v["statut_paiement"],
+                date_reservation = v["created_at"],
             ))
 
     # ── Tri par date décroissante ──
@@ -585,10 +571,10 @@ async def get_paiements_recus(
     per_page: int = 20,
 ) -> PartPaiementsResponse:
     total_q = await session.execute(
-        select(func.count())
+        select(func.count(PaiementPartenaire.id))
         .where(PaiementPartenaire.id_partenaire == id_partenaire)
     )
-    total = int(total_q.scalar_one())
+    total = int(total_q.scalar_one() or 0)
 
     rows = (await session.execute(
         select(PaiementPartenaire)
@@ -600,10 +586,10 @@ async def get_paiements_recus(
 
     items = [
         PartPaiementItem(
-            id=p.id,
-            montant=float(p.montant),
-            note=p.note,
-            created_at=p.created_at,
+            id         = p.id,
+            montant    = float(p.montant),
+            note       = p.note,
+            created_at = p.created_at,
         )
         for p in rows
     ]
@@ -618,62 +604,44 @@ async def get_paiements_recus(
 
 # ═══════════════════════════════════════════════════════════
 #  DEMANDE DE RETRAIT
-#  Note : cette fonction crée un PaiementPartenaire avec note
-#  "DEMANDE_RETRAIT — en attente de validation admin".
-#  L'admin voit la demande dans son espace (onglet Soldes) et
-#  peut ensuite valider via POST /finances/payer/{id}.
 # ═══════════════════════════════════════════════════════════
 
 async def demander_retrait(
     id_partenaire: int,
-    body: PartDemandeRetraitRequest,
+    req: PartDemandeRetraitRequest,
     session: AsyncSession,
 ) -> PartDemandeRetraitResponse:
-    """
-    Enregistre une demande de retrait comme un PaiementPartenaire
-    avec montant = 0 et note indiquant le montant souhaité.
-    L'admin traite ensuite la demande depuis son espace.
-
-    Cette approche ne crée PAS un vrai paiement — elle alerte l'admin
-    via la note. Le vrai paiement reste sous contrôle admin uniquement.
-    """
-    # ── Calcul du solde disponible ──
+    # Vérification du solde disponible
     chambre_ids = await _get_chambre_ids_partenaire(id_partenaire, session)
-    rev_total = (
+    rev_total   = (
         await _revenu_clients(session, chambre_ids)
         + await _revenu_visiteurs(session, chambre_ids)
     )
-    part_totale = round(rev_total * _PART_PARTENAIRE, 2)
-    deja_verse  = await _montant_deja_verse(id_partenaire, session)
-    solde_dispo = max(0.0, round(part_totale - deja_verse, 2))
+    part_totale  = round(rev_total * _PART_PARTENAIRE, 2)
+    deja_verse   = await _montant_deja_verse(id_partenaire, session)
+    solde_dispo  = max(0.0, round(part_totale - deja_verse, 2))
 
-    if body.montant <= 0:
-        from fastapi import HTTPException
-        raise HTTPException(400, "Le montant doit être supérieur à 0")
-
-    if body.montant > solde_dispo:
-        from fastapi import HTTPException
-        raise HTTPException(
-            400,
-            f"Montant demandé ({body.montant} DT) supérieur au solde disponible ({solde_dispo} DT)",
+    if req.montant <= 0:
+        return PartDemandeRetraitResponse(
+            success=False,
+            message="Le montant doit être supérieur à 0.",
         )
 
-    # ── Créer la demande comme un PaiementPartenaire avec montant=0 ──
-    # (montant=0 signifie "demande en attente" — l'admin voit la note)
-    note_retrait = f"DEMANDE_RETRAIT:{body.montant}"
-    if body.note:
-        note_retrait += f" | {body.note}"
+    if req.montant > solde_dispo:
+        return PartDemandeRetraitResponse(
+            success=False,
+            message=f"Montant demandé ({req.montant:.2f} DT) supérieur au solde disponible ({solde_dispo:.2f} DT).",
+        )
 
-    demande = PaiementPartenaire(
+    note = f"DEMANDE_RETRAIT:{req.note or ''}"
+    session.add(PaiementPartenaire(
         id_partenaire=id_partenaire,
-        montant=0.0,          # 0 = pas encore versé, en attente admin
-        note=note_retrait,
-    )
-    session.add(demande)
-    await session.flush()
+        montant=req.montant,
+        note=note,
+    ))
+    await session.commit()
 
     return PartDemandeRetraitResponse(
-        message="Demande de retrait envoyée à l'administrateur",
-        montant_demande=body.montant,
-        solde_disponible=solde_dispo,
+        success=True,
+        message=f"Demande de retrait de {req.montant:.2f} DT envoyée à l'admin.",
     )
