@@ -389,6 +389,7 @@ async def get_reservations_hotel(
     per_page: int = 20,
     statut: Optional[str] = None,
     search: Optional[str] = None,
+    numero_facture: Optional[str] = None,
 ) -> PartReservationListResponse:
     hotel = (await session.execute(
         select(Hotel).where(
@@ -448,7 +449,11 @@ async def get_reservations_hotel(
                 " AND (u.nom ILIKE :s OR u.prenom ILIKE :s OR u.email ILIKE :s)"
             )
             params_c["s"] = f"%{search.strip()}%"
-
+        if numero_facture and numero_facture.strip():
+            sql_clients += (
+                " AND f.numero ILIKE :nf"
+            )
+            params_c["nf"] = f"%{numero_facture.strip()}%"
         sql_clients += (
             " GROUP BY r.id, r.date_debut, r.date_fin, r.total_ttc, r.date_reservation,"
             " r.statut, u.nom, u.prenom, u.email, f.numero,"
@@ -492,9 +497,12 @@ async def get_reservations_hotel(
                 rv.created_at,
                 rv.statut,
                 rv.numero_voucher,
+                f.numero                             AS facture_numero,
                 COALESCE(cv.statut, 'EN_ATTENTE')   AS statut_paiement,
                 cv.date_paiement                     AS date_paiement
             FROM voyage_hotel.reservation_visiteur rv
+            LEFT JOIN voyage_hotel.facture f
+                ON f.id = rv.id_facture
             LEFT JOIN voyage_hotel.commission_visiteur cv
                 ON cv.id_reservation_visiteur = rv.id
                AND cv.id_partenaire            = :id_p
@@ -513,13 +521,18 @@ async def get_reservations_hotel(
                 " AND (rv.nom ILIKE :s OR rv.prenom ILIKE :s OR rv.email ILIKE :s)"
             )
             params_v["s"] = f"%{search.strip()}%"
+        if numero_facture and numero_facture.strip():
+            sql_visiteurs += (
+                " AND (f.numero ILIKE :nf OR rv.numero_voucher ILIKE :nf)"
+            )
+            params_v["nf"] = f"%{numero_facture.strip()}%"
 
         sql_visiteurs += " ORDER BY rv.created_at DESC"
 
         vis_rows = (await session.execute(sa_text(sql_visiteurs), params_v)).mappings().all()
 
         for v in vis_rows:
-            reference = v["numero_voucher"] or f"VIS-{v['id']}"
+            reference = v["facture_numero"] or v["numero_voucher"] or f"VIS-{v['id']}"
             nb_nuits  = (v["date_fin"] - v["date_debut"]).days
             montant   = float(v["total_ttc"])
             items.append(PartReservationItem(

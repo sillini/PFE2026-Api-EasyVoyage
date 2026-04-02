@@ -75,28 +75,30 @@ async def mes_hotels(
 
 
 # ── Réservations d'un hôtel ───────────────────────────────
+ 
 @router.get("/mes-hotels/{id_hotel}/reservations",
             response_model=PartReservationListResponse,
             summary="Réservations d'un hôtel (clients + visiteurs) [PARTENAIRE]")
 async def reservations_hotel(
-    id_hotel:  int,
-    page:      int           = Query(1,    ge=1),
-    per_page:  int           = Query(20,   ge=1, le=100),
-    statut:    Optional[str] = Query(None, description="CONFIRMEE | TERMINEE | ANNULEE"),
-    search:    Optional[str] = Query(None, description="Recherche sur nom ou email"),
+    id_hotel:       int,
+    page:           int           = Query(1,    ge=1),
+    per_page:       int           = Query(20,   ge=1, le=200),
+    statut:         Optional[str] = Query(None, description="CONFIRMEE | TERMINEE | ANNULEE"),
+    search:         Optional[str] = Query(None, description="Recherche sur nom ou email"),
+    numero_facture: Optional[str] = Query(None, description="Recherche par N° facture"),
     session:   AsyncSession  = Depends(get_db),
     token:     TokenData     = Depends(require_partenaire),
 ) -> PartReservationListResponse:
     return await svc.get_reservations_hotel(
-        id_partenaire=token.user_id,
-        id_hotel=id_hotel,
-        session=session,
-        page=page,
-        per_page=per_page,
-        statut=statut,
-        search=search,
+        id_partenaire  = token.user_id,
+        id_hotel       = id_hotel,
+        session        = session,
+        page           = page,
+        per_page       = per_page,
+        statut         = statut,
+        search         = search,
+        numero_facture = numero_facture,
     )
-
 
 # ── Paiements reçus ───────────────────────────────────────
 @router.get("/paiements", response_model=PartPaiementsResponse,
