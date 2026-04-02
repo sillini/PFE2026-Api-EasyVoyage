@@ -1,12 +1,5 @@
 """
 app/api/v1/router.py
-======================
-API v1 main router — tous les modules.
-
-⚠️  ORDRE IMPORTANT :
-    factures_admin DOIT être inclus AVANT factures.
-    Sinon FastAPI route /factures/admin vers /{facture_id}
-    et retourne 422 car "admin" n'est pas un entier.
 """
 from fastapi import APIRouter
 
@@ -16,7 +9,7 @@ from app.api.v1.endpoints import voyage_images
 from app.api.v1.endpoints import hotels
 from app.api.v1.endpoints import reservations
 from app.api.v1.endpoints import factures
-from app.api.v1.endpoints import factures_admin       # ← NOUVEAU
+from app.api.v1.endpoints import factures_admin
 from app.api.v1.endpoints import marketing
 from app.api.v1.endpoints import partenaires
 from app.api.v1.endpoints import hero_slides
@@ -26,6 +19,7 @@ from app.api.v1.endpoints import favoris
 from app.api.v1.endpoints import finances
 from app.api.v1.endpoints import contacts
 from app.api.v1.endpoints import finances_partenaire
+from app.api.v1.endpoints import publication_facebook    # ← NOUVEAU
 
 from app.api.v1.endpoints.demandes_partenaire import (
     public_router as demandes_public_router,
@@ -40,8 +34,8 @@ api_v1_router.include_router(voyage_images.router)
 api_v1_router.include_router(hotels.router)
 api_v1_router.include_router(reservations.router)
 
-# ⚠️  factures_admin AVANT factures (évite le conflit /factures/admin vs /factures/{id})
-api_v1_router.include_router(factures_admin.router)   # ← NOUVEAU — doit être en premier
+# ⚠️ factures_admin AVANT factures
+api_v1_router.include_router(factures_admin.router)
 api_v1_router.include_router(factures.router)
 
 api_v1_router.include_router(marketing.router)
@@ -55,3 +49,4 @@ api_v1_router.include_router(favoris.router)
 api_v1_router.include_router(finances.router)
 api_v1_router.include_router(contacts.router)
 api_v1_router.include_router(finances_partenaire.router)
+api_v1_router.include_router(publication_facebook.router)  # ← NOUVEAU
