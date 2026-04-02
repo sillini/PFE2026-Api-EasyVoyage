@@ -20,7 +20,7 @@ from app.api.v1.endpoints import finances
 from app.api.v1.endpoints import contacts
 from app.api.v1.endpoints import finances_partenaire
 from app.api.v1.endpoints import publication_facebook    # ← NOUVEAU
-
+from app.api.v1.endpoints import catalogue
 from app.api.v1.endpoints.demandes_partenaire import (
     public_router as demandes_public_router,
     admin_router  as demandes_admin_router,
@@ -50,3 +50,5 @@ api_v1_router.include_router(finances.router)
 api_v1_router.include_router(contacts.router)
 api_v1_router.include_router(finances_partenaire.router)
 api_v1_router.include_router(publication_facebook.router)  # ← NOUVEAU
+
+api_v1_router.include_router(catalogue.router)
