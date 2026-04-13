@@ -35,6 +35,16 @@ class PublicationUpdate(BaseModel):
     published_at:  Optional[datetime] = None
     error_message: Optional[str]      = None
 
+    # ── Interactions (mise à jour manuelle si besoin) ─────
+    likes_count:      Optional[int]      = None
+    comments_count:   Optional[int]      = None
+    shares_count:     Optional[int]      = None
+    reactions_count:  Optional[int]      = None
+    clicks_count:     Optional[int]      = None
+    reach_count:      Optional[int]      = None
+    impressions:      Optional[int]      = None
+    stats_updated_at: Optional[datetime] = None
+
 
 # ═══════════════════════════════════════════════════════════
 #  PUBLICATION — RESPONSE
@@ -53,6 +63,16 @@ class PublicationResponse(BaseModel):
     created_at:    datetime
     updated_at:    datetime
 
+    # ── Interactions Facebook ─────────────────────────────
+    likes_count:      Optional[int]      = 0
+    comments_count:   Optional[int]      = 0
+    shares_count:     Optional[int]      = 0
+    reactions_count:  Optional[int]      = 0
+    clicks_count:     Optional[int]      = 0
+    reach_count:      Optional[int]      = 0
+    impressions:      Optional[int]      = 0
+    stats_updated_at: Optional[datetime] = None
+
     model_config = {"from_attributes": True}
 
 
@@ -60,9 +80,69 @@ class PublicationResponse(BaseModel):
 #  PUBLICATION — LIST RESPONSE
 # ═══════════════════════════════════════════════════════════
 class PublicationListResponse(BaseModel):
+    total: int
+    page:  int
+    items: List[PublicationResponse]
+
+
+# ═══════════════════════════════════════════════════════════
+#  INTERACTIONS — SYNC RESPONSE (pour un post)
+# ═══════════════════════════════════════════════════════════
+class PostInteractionsResponse(BaseModel):
+    id:               int
+    fb_post_id:       Optional[str]
+    likes_count:      int = 0
+    comments_count:   int = 0
+    shares_count:     int = 0
+    reactions_count:  int = 0
+    clicks_count:     int = 0
+    reach_count:      int = 0
+    impressions:      int = 0
+    stats_updated_at: Optional[datetime] = None
+    synced:           bool = False
+    error:            Optional[str] = None
+
+
+# ═══════════════════════════════════════════════════════════
+#  INTERACTIONS — SYNC ALL RESPONSE
+# ═══════════════════════════════════════════════════════════
+class SyncAllResponse(BaseModel):
+    synced:  int
     total:   int
-    page:    int
-    items:   List[PublicationResponse]
+    errors:  List[dict] = []
+    message: str
+
+
+# ═══════════════════════════════════════════════════════════
+#  DASHBOARD — RESPONSE GLOBAL
+# ═══════════════════════════════════════════════════════════
+class DashboardResponse(BaseModel):
+    # Compteurs de publications
+    total_publications: int = 0
+    published_count:    int = 0
+    draft_count:        int = 0
+
+    # Totaux agrégés des interactions
+    total_likes:       int = 0
+    total_comments:    int = 0
+    total_shares:      int = 0
+    total_reactions:   int = 0
+    total_clicks:      int = 0
+    total_reach:       int = 0
+    total_impressions: int = 0
+
+    # Top publication (la plus engagée)
+    top_post_id:         Optional[int] = None
+    top_post_fb_id:      Optional[str] = None
+    top_post_message:    Optional[str] = None
+    top_post_likes:      int = 0
+    top_post_engagement: int = 0
+
+    # Taux d'engagement moyen (interactions / reach * 100)
+    avg_engagement_rate: float = 0.0
+
+    # Dernière synchronisation
+    last_sync_at: Optional[datetime] = None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -71,7 +151,7 @@ class PublicationListResponse(BaseModel):
 class FacebookConfigUpdate(BaseModel):
     page_access_token: str = Field(..., min_length=10)
     page_id:           str = Field(..., min_length=5)
-    page_name:         Optional[str] = None
+    page_name:         Optional[str]      = None
     token_expires_at:  Optional[datetime] = None
 
 
@@ -79,12 +159,12 @@ class FacebookConfigUpdate(BaseModel):
 #  FACEBOOK CONFIG — RESPONSE (sans token pour sécurité)
 # ═══════════════════════════════════════════════════════════
 class FacebookConfigResponse(BaseModel):
-    id:                int
-    page_id:           Optional[str]
-    page_name:         Optional[str]
-    token_actif:       bool
-    token_expires_at:  Optional[datetime]
-    updated_at:        datetime
+    id:               int
+    page_id:          Optional[str]
+    page_name:        Optional[str]
+    token_actif:      bool
+    token_expires_at: Optional[datetime]
+    updated_at:       datetime
 
     model_config = {"from_attributes": True}
 

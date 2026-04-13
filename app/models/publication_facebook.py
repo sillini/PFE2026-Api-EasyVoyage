@@ -13,7 +13,7 @@ from typing import Optional
 
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, Enum as SAEnum,
-    ForeignKey, String, Text, func,
+    ForeignKey, Integer, String, Text, func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -41,7 +41,7 @@ class PublicationFacebook(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
-    # Contenu
+    # ── Contenu ───────────────────────────────────────────
     message: Mapped[str] = mapped_column(Text, nullable=False)
 
     # ✅ values_callable force "hotel" au lieu de "HOTEL"
@@ -75,8 +75,21 @@ class PublicationFacebook(Base):
     published_at:  Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     error_message: Mapped[Optional[str]]      = mapped_column(Text, nullable=True)
 
-    # FK vers utilisateur — sans schema dans ForeignKey car utilisateur
-    # est déjà dans voyage_hotel via son propre __table_args__
+    # ── Statistiques d'interactions Facebook ──────────────
+    likes_count:      Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=0)
+    comments_count:   Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=0)
+    shares_count:     Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=0)
+    reactions_count:  Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=0)
+    clicks_count:     Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=0)
+    reach_count:      Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=0)
+    impressions:      Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=0)
+    stats_updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # ── FK vers utilisateur ───────────────────────────────
+    # Sans schema dans ForeignKey car utilisateur est déjà
+    # dans voyage_hotel via son propre __table_args__
     id_admin: Mapped[Optional[int]] = mapped_column(
         BigInteger,
         ForeignKey("utilisateur.id", ondelete="SET NULL"),
