@@ -4,27 +4,34 @@ app/api/v1/endpoints/promotions.py
 Endpoints pour la gestion des promotions.
 
 Routes PARTENAIRE :
-  GET    /promotions/mes-promotions           → Liste des promos de ses hôtels
-  GET    /promotions/{promo_id}                → Détail d'une promo
-  POST   /promotions/hotels/{hotel_id}          → Créer une promo pour un hôtel
-  PUT    /promotions/{promo_id}                 → Modifier une promo
-  PATCH  /promotions/{promo_id}/toggle          → Activer/désactiver
-  DELETE /promotions/{promo_id}                 → Supprimer une promo
+  GET    /promotions/mes-promotions           → Liste des promos du partenaire
+  GET    /promotions/{promo_id}               → Détail d'une promo
+  POST   /promotions/hotels/{hotel_id}        → Créer une promo (statut PENDING)
+  PUT    /promotions/{promo_id}               → Modifier (si PENDING ou REJECTED)
+  DELETE /promotions/{promo_id}               → Supprimer (si non APPROVED)
+
+Routes ADMIN :
+  GET    /promotions/admin/all                → Toutes les promos avec filtres
+  GET    /promotions/admin/pending-count      → Nombre de demandes en attente
+  POST   /promotions/admin/{promo_id}/decision→ Accepter ou refuser
+  PATCH  /promotions/admin/{promo_id}/toggle  → Activer/désactiver (si APPROVED)
 
 Routes PUBLIC :
-  GET    /promotions/hotels/{hotel_id}/active   → Promo active d'un hôtel (pour visiteur)
+  GET    /promotions/hotels/{hotel_id}/active → Promo active d'un hôtel (visiteur)
 """
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.dependencies import require_partenaire
+from app.api.v1.dependencies import get_current_user, require_admin, require_partenaire
 from app.db.session import get_db
 from app.schemas.auth import TokenData
 from app.schemas.promotion import (
+    DecisionAdmin,
     PromotionCreate,
     PromotionListResponse,
+    PromotionPendingCount,
     PromotionResponse,
     PromotionUpdate,
 )
@@ -43,16 +50,16 @@ router = APIRouter(prefix="/promotions", tags=["Promotions"])
     summary="Liste mes promotions [PARTENAIRE]",
 )
 async def list_mes_promotions(
-    hotel_id:   Optional[int] = Query(None, description="Filtrer par hôtel"),
-    actif_only: bool          = Query(False, description="Uniquement les promos actives maintenant"),
-    session:    AsyncSession  = Depends(get_db),
-    token:      TokenData     = Depends(require_partenaire),
+    hotel_id: Optional[int] = Query(None),
+    statut:   Optional[str] = Query(None, description="PENDING | APPROVED | REJECTED"),
+    session:  AsyncSession  = Depends(get_db),
+    token:    TokenData     = Depends(require_partenaire),
 ):
     return await svc.list_promotions_partenaire(
         partenaire_id=token.user_id,
         session=session,
         hotel_id=hotel_id,
-        actif_only=actif_only,
+        statut=statut,
     )
 
 
@@ -73,7 +80,7 @@ async def get_promotion(
     "/hotels/{hotel_id}",
     response_model=PromotionResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Créer une promotion pour un hôtel [PARTENAIRE]",
+    summary="Créer une promotion (statut PENDING) [PARTENAIRE]",
 )
 async def create_promotion(
     hotel_id: int,
@@ -87,7 +94,7 @@ async def create_promotion(
 @router.put(
     "/{promo_id}",
     response_model=PromotionResponse,
-    summary="Modifier une promotion [PARTENAIRE]",
+    summary="Modifier une promotion [PARTENAIRE — si PENDING ou REJECTED]",
 )
 async def update_promotion(
     promo_id: int,
@@ -98,24 +105,10 @@ async def update_promotion(
     return await svc.update_promotion(promo_id, data, token.user_id, session)
 
 
-@router.patch(
-    "/{promo_id}/toggle",
-    response_model=PromotionResponse,
-    summary="Activer/désactiver une promotion [PARTENAIRE]",
-)
-async def toggle_promotion(
-    promo_id: int,
-    actif:    bool         = Query(..., description="true pour activer, false pour désactiver"),
-    session:  AsyncSession = Depends(get_db),
-    token:    TokenData    = Depends(require_partenaire),
-):
-    return await svc.toggle_actif(promo_id, actif, token.user_id, session)
-
-
 @router.delete(
     "/{promo_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    summary="Supprimer une promotion [PARTENAIRE]",
+    summary="Supprimer une promotion [PARTENAIRE — si non APPROVED]",
 )
 async def delete_promotion(
     promo_id: int,
@@ -126,35 +119,93 @@ async def delete_promotion(
 
 
 # ═══════════════════════════════════════════════════════════
-#  PUBLIC — Affichage sur les pages visiteur
+#  ADMIN
+# ═══════════════════════════════════════════════════════════
+
+@router.get(
+    "/admin/all",
+    response_model=PromotionListResponse,
+    summary="Toutes les promotions [ADMIN]",
+)
+async def list_all_promotions(
+    statut:        Optional[str] = Query(None, description="PENDING | APPROVED | REJECTED"),
+    hotel_id:      Optional[int] = Query(None),
+    partenaire_id: Optional[int] = Query(None),
+    page:          int           = Query(1, ge=1),
+    per_page:      int           = Query(20, ge=1, le=100),
+    session:       AsyncSession  = Depends(get_db),
+    _:             TokenData     = Depends(require_admin),
+):
+    return await svc.list_promotions_admin(
+        session=session,
+        statut=statut,
+        hotel_id=hotel_id,
+        partenaire_id=partenaire_id,
+        page=page,
+        per_page=per_page,
+    )
+
+
+@router.get(
+    "/admin/pending-count",
+    response_model=PromotionPendingCount,
+    summary="Nombre de promotions en attente [ADMIN]",
+)
+async def get_pending_count(
+    session: AsyncSession = Depends(get_db),
+    _:       TokenData    = Depends(require_admin),
+):
+    count = await svc.get_pending_count(session)
+    return PromotionPendingCount(pending=count)
+
+
+@router.post(
+    "/admin/{promo_id}/decision",
+    response_model=PromotionResponse,
+    summary="Accepter ou refuser une promotion [ADMIN]",
+)
+async def traiter_promotion(
+    promo_id: int,
+    data:     DecisionAdmin,
+    session:  AsyncSession = Depends(get_db),
+    token:    TokenData    = Depends(require_admin),
+):
+    """
+    action = "APPROVED" → promotion visible côté visiteur + email au partenaire
+    action = "REJECTED" → promotion refusée + email avec raison au partenaire
+    """
+    return await svc.traiter_promotion(promo_id, data, token.user_id, session)
+
+
+@router.patch(
+    "/admin/{promo_id}/toggle",
+    response_model=PromotionResponse,
+    summary="Activer/désactiver une promotion approuvée [ADMIN]",
+)
+async def toggle_actif_admin(
+    promo_id: int,
+    actif:    bool        = Query(...),
+    session:  AsyncSession = Depends(get_db),
+    token:    TokenData   = Depends(require_admin),
+):
+    return await svc.toggle_actif_admin(promo_id, actif, token.user_id, session)
+
+
+# ═══════════════════════════════════════════════════════════
+#  PUBLIC — Affichage côté visiteur
 # ═══════════════════════════════════════════════════════════
 
 @router.get(
     "/hotels/{hotel_id}/active",
     response_model=Optional[PromotionResponse],
-    summary="Promotion active d'un hôtel (PUBLIC)",
+    summary="Promotion active d'un hôtel (PUBLIC — APPROVED uniquement)",
 )
 async def get_active_hotel_promo(
     hotel_id: int,
     session:  AsyncSession = Depends(get_db),
 ):
     """
-    Retourne la meilleure promotion active pour un hôtel à la date actuelle.
-    Retourne null si aucune promotion n'est active.
+    Retourne la meilleure promotion APPROVED + actif + dans dates pour un hôtel.
+    Retourne null si aucune promotion éligible.
     """
-    from sqlalchemy import select
-    from sqlalchemy.orm import selectinload
-    from app.models.promotion import Promotion
-
-    promo = await svc.get_promotion_active_hotel(hotel_id, session)
-    if not promo:
-        return None
-
-    # Recharger avec la relation hotel pour la réponse
-    result = await session.execute(
-        select(Promotion)
-        .options(selectinload(Promotion.hotel))
-        .where(Promotion.id == promo.id)
-    )
-    promo = result.scalar_one()
-    return svc._to_response(promo)
+    return await svc.get_promotion_active_hotel(hotel_id, session)

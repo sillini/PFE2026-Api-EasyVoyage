@@ -3,13 +3,13 @@ app/models/promotion.py
 ========================
 ORM model pour la table `promotion`.
 
-Une promotion est liée à un hôtel et s'applique sur une période donnée
-avec un pourcentage de réduction.
+Workflow de validation :
+  PENDING  → créée par le partenaire, en attente de validation admin
+  APPROVED → validée par l'admin, visible côté visiteur
+  REJECTED → refusée par l'admin, avec raison optionnelle
 
-Types supportés :
-  - STANDARD      : promotion classique sur toute la période
-  - EARLY_BOOKING : réservation anticipée (ex: -15% si réservé 60j à l'avance)
-  - LAST_MINUTE   : réservation de dernière minute (ex: -25% si réservé < 7j avant)
+Le champ `actif` reste présent pour permettre à l'admin de désactiver
+temporairement une promo approuvée sans la supprimer.
 """
 import enum
 from datetime import date, datetime
@@ -17,17 +17,17 @@ from typing import Optional
 
 from sqlalchemy import (
     BigInteger, Boolean, Date, DateTime, Enum,
-    ForeignKey, Integer, Numeric, String, Text, func,
+    ForeignKey, Numeric, String, Text, func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 
 
-class TypePromotion(str, enum.Enum):
-    STANDARD      = "STANDARD"
-    EARLY_BOOKING = "EARLY_BOOKING"
-    LAST_MINUTE   = "LAST_MINUTE"
+class StatutPromotion(str, enum.Enum):
+    PENDING  = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
 
 
 class Promotion(Base):
@@ -44,6 +44,7 @@ class Promotion(Base):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # ── Lien avec l'hôtel ───────────────────────────────────
+    # ForeignKey sans schéma — cohérent avec hotel.py, chambre.py, favori.py…
     id_hotel: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("hotel.id", ondelete="CASCADE", onupdate="CASCADE"),
@@ -57,32 +58,42 @@ class Promotion(Base):
         comment="Pourcentage de réduction entre 1 et 99"
     )
 
-    # ── Type de promotion ───────────────────────────────────
-    type_promotion: Mapped[TypePromotion] = mapped_column(
-        Enum(TypePromotion, name="type_promotion_enum", schema="voyage_hotel"),
-        nullable=False, default=TypePromotion.STANDARD,
-    )
-
-    # Pour EARLY_BOOKING : nombre de jours minimum avant l'arrivée
-    jours_avant_min: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    # Pour LAST_MINUTE : nombre de jours maximum avant l'arrivée
-    jours_avant_max: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-
     # ── Période de validité ─────────────────────────────────
     date_debut: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     date_fin:   Mapped[date] = mapped_column(Date, nullable=False, index=True)
 
-    # ── Types de chambres concernés (JSON array, optionnel) ─
-    # Si NULL → s'applique à toutes les chambres de l'hôtel
-    # Si [1, 3] → s'applique seulement aux types de chambre d'ID 1 et 3
-    types_chambre_ids: Mapped[Optional[str]] = mapped_column(
-        Text, nullable=True,
-        comment="Liste d'IDs de type_chambre au format JSON, NULL = tous les types"
+    # ── Statut workflow (PENDING → APPROVED | REJECTED) ─────
+    statut: Mapped[StatutPromotion] = mapped_column(
+        Enum(StatutPromotion, name="statut_promotion_enum", schema="voyage_hotel"),
+        nullable=False,
+        default=StatutPromotion.PENDING,
+        index=True,
     )
 
-    # ── Statut ──────────────────────────────────────────────
-    actif: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True, index=True
+    # ── Activation manuelle (override admin) ────────────────
+    actif: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # ── Créateur (partenaire) ───────────────────────────────
+    id_partenaire: Mapped[Optional[int]] = mapped_column(
+        BigInteger,
+        ForeignKey("utilisateur.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # ── Validateur (admin) ──────────────────────────────────
+    id_admin_validateur: Mapped[Optional[int]] = mapped_column(
+        BigInteger,
+        ForeignKey("utilisateur.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    # ── Raison de refus (optionnel) ─────────────────────────
+    raison_refus: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # ── Date de décision admin ──────────────────────────────
+    date_decision: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     # ── Timestamps ──────────────────────────────────────────
@@ -91,19 +102,32 @@ class Promotion(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
-        server_default=func.now(), onupdate=func.now(),
+        server_default=func.now(), onupdate=func.now()
     )
 
     # ── Relations ───────────────────────────────────────────
-    hotel: Mapped["Hotel"] = relationship(  # type: ignore[name-defined]
+    hotel: Mapped["Hotel"] = relationship(          # type: ignore[name-defined]
         "Hotel",
         foreign_keys=[id_hotel],
         primaryjoin="Promotion.id_hotel == Hotel.id",
         back_populates="promotions",
+        lazy="select",
+    )
+    partenaire: Mapped[Optional["Utilisateur"]] = relationship(   # type: ignore[name-defined]
+        "Utilisateur",
+        foreign_keys=[id_partenaire],
+        primaryjoin="Promotion.id_partenaire == Utilisateur.id",
+        lazy="select",
+    )
+    validateur: Mapped[Optional["Utilisateur"]] = relationship(   # type: ignore[name-defined]
+        "Utilisateur",
+        foreign_keys=[id_admin_validateur],
+        primaryjoin="Promotion.id_admin_validateur == Utilisateur.id",
+        lazy="select",
     )
 
     def __repr__(self) -> str:
         return (
-            f"<Promotion id={self.id} hotel={self.id_hotel} "
-            f"-{self.pourcentage}% {self.date_debut}→{self.date_fin}>"
+            f"<Promotion id={self.id} titre={self.titre!r} "
+            f"statut={self.statut} hotel={self.id_hotel}>"
         )

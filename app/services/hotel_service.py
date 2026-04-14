@@ -9,6 +9,7 @@ Logique de disponibilité par stock :
 
 Enrichissement automatique avec promotions :
   - Chaque HotelResponse contient prix_min, prix_min_promo, promotion_active, etc.
+  - Seules les promotions APPROVED + actif + dans dates sont visibles côté visiteur
 """
 from collections import defaultdict
 from datetime import date
@@ -36,10 +37,6 @@ from app.schemas.hotel import (
 # ═══════════════════════════════════════════════════════════
 
 async def _get_prix_min_hotel(hotel_id: int, session: AsyncSession) -> Optional[float]:
-    """
-    Retourne le prix minimum courant d'un hôtel en parcourant
-    les tarifs actifs aujourd'hui pour toutes ses chambres actives.
-    """
     today = date.today()
     row = (await session.execute(
         select(func.min(Tarif.prix))
@@ -57,10 +54,6 @@ async def _get_prix_min_hotel(hotel_id: int, session: AsyncSession) -> Optional[
 async def _get_prix_min_multi_hotels(
     hotel_ids: list[int], session: AsyncSession
 ) -> dict:
-    """
-    Optimisation : récupère en UNE requête le prix min de plusieurs hôtels.
-    Retourne un dict {hotel_id: prix_min}.
-    """
     if not hotel_ids:
         return {}
 
@@ -89,12 +82,8 @@ async def _get_prix_min_multi_hotels(
 def _to_hotel_response(
     hotel: Hotel,
     prix_min: Optional[float] = None,
-    promo=None,  # Promotion ou None
+    promo=None,  # Promotion ORM ou None
 ) -> HotelResponse:
-    """
-    Convertit un Hotel ORM en HotelResponse, avec injection optionnelle
-    des données de promotion et du prix minimum.
-    """
     # Import local pour éviter les imports circulaires
     from app.services.promotion_service import calculer_prix_promo
 
@@ -120,11 +109,7 @@ def _to_hotel_response(
         promotion_active      = True
         promotion_pourcentage = float(promo.pourcentage)
         promotion_titre       = promo.titre
-        promotion_type        = (
-            promo.type_promotion.value
-            if hasattr(promo.type_promotion, "value")
-            else str(promo.type_promotion)
-        )
+        promotion_type        = "STANDARD"   # ← type_promotion supprimé (workflow PENDING/APPROVED/REJECTED)
         promotion_date_fin    = promo.date_fin
 
     return HotelResponse(
@@ -155,21 +140,12 @@ def _to_hotel_response(
 async def _enrichir_hotels(
     hotels_list: list[Hotel], session: AsyncSession
 ) -> list[HotelResponse]:
-    """
-    Enrichit une liste d'hôtels avec les données de prix et promotions
-    en un minimum de requêtes SQL.
-    """
     from app.services.promotion_service import get_promotions_actives_multi_hotels
 
     hotel_ids = [h.id for h in hotels_list]
-
-    # 1. Récupère tous les prix min en UNE requête
-    prix_by_hotel = await _get_prix_min_multi_hotels(hotel_ids, session)
-
-    # 2. Récupère toutes les promos actives en UNE requête
+    prix_by_hotel   = await _get_prix_min_multi_hotels(hotel_ids, session)
     promos_by_hotel = await get_promotions_actives_multi_hotels(hotel_ids, session)
 
-    # 3. Construit les réponses enrichies
     return [
         _to_hotel_response(
             h,
@@ -236,10 +212,6 @@ def _to_avis_response(avis: Avis, utilisateur: Optional[Utilisateur]) -> AvisRes
 async def _count_reservations_periode(
     chambre_id: int, date_debut, date_fin, session: AsyncSession
 ) -> int:
-    """
-    Compte combien de réservations CONFIRMEES occupent cette chambre (type)
-    sur la période donnée. Chaque réservation = 1 chambre physique utilisée.
-    """
     from app.models.reservation import Reservation, StatutReservation, LigneReservationChambre
     result = await session.execute(
         select(func.count())
@@ -296,7 +268,6 @@ async def list_hotels(
     query = query.offset((page - 1) * per_page).limit(per_page)
     hotels = (await session.execute(query)).scalars().all()
 
-    # ── Enrichissement avec prix + promotions ──────────
     items = await _enrichir_hotels(hotels, session)
 
     return HotelListResponse(
@@ -314,7 +285,6 @@ async def get_hotel(hotel_id: int, session: AsyncSession) -> HotelResponse:
     if not hotel:
         raise NotFoundException(f"Hôtel {hotel_id} introuvable")
 
-    # Enrichir avec prix + promo
     prix_min = await _get_prix_min_hotel(hotel_id, session)
     promo    = await get_promotion_active_hotel(hotel_id, session)
 
@@ -436,7 +406,6 @@ async def get_chambre(hotel_id: int, chambre_id: int, session: AsyncSession) -> 
 async def create_chambre(hotel_id: int, data: ChambreCreate, session: AsyncSession) -> ChambreResponse:
     await _check_hotel(hotel_id, session)
 
-    # Vérifier si une chambre de ce type existe déjà pour cet hôtel
     existing = (await session.execute(
         select(Chambre).where(
             Chambre.id_hotel == hotel_id,
@@ -445,7 +414,6 @@ async def create_chambre(hotel_id: int, data: ChambreCreate, session: AsyncSessi
     )).scalar_one_or_none()
 
     if existing:
-        # Mettre à jour le stock au lieu de créer un doublon
         existing.nb_chambres += data.nb_chambres
         existing.capacite     = data.capacite
         if data.description:
@@ -612,11 +580,6 @@ async def delete_avis(
     role: str,
     session: AsyncSession,
 ) -> None:
-    """
-    Supprime un avis.
-    - ADMIN  : peut supprimer n'importe quel avis de cet hôtel
-    - CLIENT : peut supprimer uniquement son propre avis
-    """
     avis = (await session.execute(
         select(Avis).where(Avis.id == avis_id, Avis.id_hotel == hotel_id)
     )).scalar_one_or_none()
@@ -641,8 +604,8 @@ async def get_hotel_disponibilites(
     date_debut,
     date_fin,
     session:      AsyncSession,
-    role:         str          = "ADMIN",   # "ADMIN" | "PARTENAIRE" | "PUBLIC"
-    capacite_min: Optional[int] = None,     # filtre capacité
+    role:         str          = "ADMIN",
+    capacite_min: Optional[int] = None,
 ):
     from app.models.reservation import (
         Reservation, StatutReservation,
@@ -654,7 +617,6 @@ async def get_hotel_disponibilites(
 
     await _check_hotel(hotel_id, session)
 
-    # ── Requête chambres avec filtre capacite_min optionnel ──────────────────
     q = (
         select(Chambre)
         .options(selectinload(Chambre.type_chambre))
@@ -669,7 +631,6 @@ async def get_hotel_disponibilites(
     chambres_dispo = []
     for ch in chambres:
 
-        # ── 1. Réservations CLIENTS ──────────────────────────────────────────
         nb_clients = (await session.execute(
             select(func.count())
             .select_from(LigneReservationChambre)
@@ -682,7 +643,6 @@ async def get_hotel_disponibilites(
             )
         )).scalar_one()
 
-        # ── 2. Réservations VISITEURS ────────────────────────────────────────
         nb_visiteurs = (await session.execute(
             select(func.count())
             .select_from(ReservationVisiteur)
@@ -694,13 +654,11 @@ async def get_hotel_disponibilites(
             )
         )).scalar_one()
 
-        # ── 3. Calcul stock ──────────────────────────────────────────────────
         nb_reservees   = nb_clients + nb_visiteurs
         nb_total       = ch.nb_chambres
         nb_disponibles = max(0, nb_total - nb_reservees)
         is_available   = nb_disponibles > 0
 
-        # ── 4. Occupations détaillées (admin/partenaire seulement) ───────────
         occupations = []
         if role in ("ADMIN", "PARTENAIRE"):
             resas_c = (await session.execute(
@@ -743,7 +701,6 @@ async def get_hotel_disponibilites(
 
             occupations.sort(key=lambda o: o.date_debut)
 
-        # ── 5. Tarif courant ─────────────────────────────────────────────────
         tarif = (await session.execute(
             select(Tarif)
             .where(
@@ -773,7 +730,6 @@ async def get_hotel_disponibilites(
             description=ch.description,
         ))
 
-    # ── Filtrage PUBLIC : masquer les types dont nb_disponibles == 0 ─────────
     if role == "PUBLIC":
         chambres_dispo = [c for c in chambres_dispo if c.disponible]
 
@@ -906,7 +862,6 @@ async def list_hotels_en_avant(session: AsyncSession) -> HotelListResponse:
             .limit(12)
         )).scalars().all()
 
-    # ── Enrichissement avec prix + promotions ──────────
     items = await _enrichir_hotels(hotels, session)
 
     return HotelListResponse(

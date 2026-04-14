@@ -20,7 +20,7 @@ from app.api.v1.endpoints import finances
 from app.api.v1.endpoints import contacts
 from app.api.v1.endpoints import finances_partenaire
 from app.api.v1.endpoints import publication_facebook
-from app.api.v1.endpoints import facebook_interactions     # ← NOUVEAU
+from app.api.v1.endpoints import facebook_interactions
 from app.api.v1.endpoints import catalogue
 from app.api.v1.endpoints.demandes_partenaire import (
     public_router as demandes_public_router,
@@ -28,6 +28,7 @@ from app.api.v1.endpoints.demandes_partenaire import (
 )
 from app.api.v1.endpoints import hotel_ai_analysis
 from app.api.v1.endpoints import promotions
+from app.api.v1.endpoints import fiscal                    # ← NOUVEAU
 
 api_v1_router = APIRouter(prefix="/api/v1")
 
@@ -54,10 +55,10 @@ api_v1_router.include_router(contacts.router)
 api_v1_router.include_router(finances_partenaire.router)
 
 # ⚠️ facebook_interactions AVANT publication_facebook
-# pour éviter que /publications/{pub_id} capte /publications/sync-all-stats
-api_v1_router.include_router(facebook_interactions.router)  # ← NOUVEAU
+api_v1_router.include_router(facebook_interactions.router)
 api_v1_router.include_router(publication_facebook.router)
 
 api_v1_router.include_router(catalogue.router)
 api_v1_router.include_router(hotel_ai_analysis.router)
 api_v1_router.include_router(promotions.router)
+api_v1_router.include_router(fiscal.router)                # ← NOUVEAU

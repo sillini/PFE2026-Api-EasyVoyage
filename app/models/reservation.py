@@ -73,7 +73,6 @@ class Reservation(Base):
     )
 
     # ── Nombre de voyageurs (utilisé uniquement pour les réservations voyage) ─
-    # Pour les réservations hôtel, ces champs sont dans LigneReservationChambre
     nb_adultes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     nb_enfants: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
@@ -133,7 +132,16 @@ class Facture(Base):
     date_emission: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
-    montant_total: Mapped[float]  = mapped_column(Numeric(12, 2), nullable=False)
+    montant_total: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+
+    # ── Détail fiscal (nullable pour rétrocompatibilité) ──────────────────────
+    montant_ht:        Mapped[Optional[float]] = mapped_column(Numeric(12, 3), nullable=True)
+    taxe_sejour:       Mapped[Optional[float]] = mapped_column(Numeric(12, 3), nullable=True)
+    tva_montant:       Mapped[Optional[float]] = mapped_column(Numeric(12, 3), nullable=True)
+    taux_tva:          Mapped[Optional[float]] = mapped_column(Numeric(5,  2), nullable=True)
+    droit_timbre:      Mapped[Optional[float]] = mapped_column(Numeric(12, 3), nullable=True)
+    nb_nuits_taxables: Mapped[Optional[int]]   = mapped_column(Integer, nullable=True)
+
     statut: Mapped[StatutFacture] = mapped_column(
         Enum(StatutFacture, name="statut_facture", schema="voyage_hotel"),
         nullable=False, default=StatutFacture.EMISE,
@@ -219,6 +227,15 @@ class ReservationVisiteur(Base):
     nb_adultes:       Mapped[int]            = mapped_column(Integer, nullable=False, default=1)
     nb_enfants:       Mapped[int]            = mapped_column(Integer, nullable=False, default=0)
     total_ttc:        Mapped[float]          = mapped_column(Numeric(12, 2), nullable=False, default=0.0)
+
+    # ── Détail fiscal (nullable pour rétrocompatibilité) ──────────────────────
+    montant_ht:        Mapped[Optional[float]] = mapped_column(Numeric(12, 3), nullable=True)
+    taxe_sejour:       Mapped[Optional[float]] = mapped_column(Numeric(12, 3), nullable=True)
+    tva_montant:       Mapped[Optional[float]] = mapped_column(Numeric(12, 3), nullable=True)
+    taux_tva:          Mapped[Optional[float]] = mapped_column(Numeric(5,  2), nullable=True)
+    droit_timbre:      Mapped[Optional[float]] = mapped_column(Numeric(12, 3), nullable=True)
+    nb_nuits_taxables: Mapped[Optional[int]]   = mapped_column(Integer, nullable=True)
+
     methode_paiement: Mapped[str]            = mapped_column(String(30), nullable=False, default="CARTE_BANCAIRE")
     transaction_id:   Mapped[Optional[str]]  = mapped_column(String(200), nullable=True, unique=True)
     statut:           Mapped[str]            = mapped_column(String(30), nullable=False, default="CONFIRMEE")

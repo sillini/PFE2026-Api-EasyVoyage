@@ -8,6 +8,7 @@ Routes :
                                                       + envoi automatique du voucher par email
                                                       + création automatique de la facture
                                                       + application automatique des promotions
+                                                      + calcul fiscal dynamique (taxe séjour, TVA, timbre)
   GET   /reservations/mes-reservations              → Mes réservations [CLIENT]
   GET   /reservations                               → Toutes [ADMIN]
   GET   /reservations/admin/enrichi                 → Clients + Visiteurs enrichis [ADMIN]
@@ -128,7 +129,7 @@ class VisiteurReservationResponse(_BM):
     "/visiteur",
     response_model=VisiteurReservationResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Réservation hôtel visiteur sans compte (+ voucher email + facture auto)",
+    summary="Réservation hôtel visiteur sans compte (+ voucher email + facture auto + fiscal)",
 )
 async def reserver_visiteur(
     data: VisiteurReservationRequest,
@@ -137,11 +138,11 @@ async def reserver_visiteur(
     from datetime import date as _date
     from app.models.hotel import Hotel as _H
     from app.services.reservation_service import _generate_numero_facture
-    # ── Import du service promotion ─────────────────────────
     from app.services.promotion_service import (
         get_promotion_active_hotel,
         calculer_prix_promo,
     )
+    from app.services.fiscal_service import calculer_fiscal  # ← FISCAL
 
     # ── 1. Valider les dates ───────────────────────────────
     try:
@@ -177,14 +178,29 @@ async def reserver_visiteur(
     if not tarif:
         raise HTTPException(422, f"Aucun tarif disponible pour la période {d1} → {d2}")
 
-    # ── 4. Calcul du prix avec application automatique de la promo ──
+    # ── 4. Calcul du prix HT avec promo éventuelle ─────────
     prix_base = float(tarif.prix) * nb_nuits
-
     promo = await get_promotion_active_hotel(chambre.id_hotel, session, at_date=d1)
     if promo:
-        total_ttc = calculer_prix_promo(prix_base, float(promo.pourcentage))
+        montant_ht = calculer_prix_promo(prix_base, float(promo.pourcentage))
     else:
-        total_ttc = round(prix_base, 2)
+        montant_ht = round(prix_base, 2)
+
+    # ── 4b. Appliquer la logique fiscale dynamique ─────────
+    h_res = await session.execute(_sel(_H).where(_H.id == chambre.id_hotel))
+    hotel_obj = h_res.scalar_one_or_none()
+    etoiles   = hotel_obj.etoiles if hotel_obj else 3
+
+    nb_personnes_vis = (data.nb_adultes or 1) + (data.nb_enfants or 0)
+
+    fiscal = await calculer_fiscal(
+        montant_ht    = montant_ht,
+        nb_nuits      = nb_nuits,
+        nb_personnes  = nb_personnes_vis,
+        etoiles_hotel = etoiles,
+        session       = session,
+    )
+    total_ttc = fiscal.total_ttc
 
     # ── 5. Générer un numéro de voucher unique ─────────────
     annee  = d1.year
@@ -192,33 +208,47 @@ async def reserver_visiteur(
     cnt    = cnt_r.scalar_one() + 1
     numero_voucher = f"VIS-{annee}-{cnt:05d}-{_uuid.uuid4().hex[:4].upper()}"
 
-    # ── 6. Créer la réservation visiteur ───────────────────
+    # ── 6. Créer la réservation visiteur avec détail fiscal ─
     resa = _RV(
-        nom              = data.nom,
-        prenom           = data.prenom,
-        email            = data.email,
-        telephone        = data.telephone,
-        id_chambre       = data.id_chambre,
-        date_debut       = d1,
-        date_fin         = d2,
-        nb_adultes       = data.nb_adultes,
-        nb_enfants       = data.nb_enfants,
-        total_ttc        = total_ttc,
-        methode_paiement = data.methode,
-        transaction_id   = "T-" + _uuid.uuid4().hex[:8].upper(),
-        statut           = "CONFIRMEE",
-        numero_voucher   = numero_voucher,
+        nom               = data.nom,
+        prenom            = data.prenom,
+        email             = data.email,
+        telephone         = data.telephone,
+        id_chambre        = data.id_chambre,
+        date_debut        = d1,
+        date_fin          = d2,
+        nb_adultes        = data.nb_adultes,
+        nb_enfants        = data.nb_enfants,
+        total_ttc         = fiscal.total_ttc,
+        # ── Détail fiscal stocké ────────────────────────────
+        montant_ht        = fiscal.montant_ht,
+        taxe_sejour       = fiscal.taxe_sejour,
+        tva_montant       = fiscal.tva_montant,
+        taux_tva          = fiscal.taux_tva,
+        droit_timbre      = fiscal.droit_timbre,
+        nb_nuits_taxables = fiscal.nb_nuits_taxables,
+        # ───────────────────────────────────────────────────
+        methode_paiement  = data.methode,
+        transaction_id    = "T-" + _uuid.uuid4().hex[:8].upper(),
+        statut            = "CONFIRMEE",
+        numero_voucher    = numero_voucher,
     )
     session.add(resa)
     await session.flush()
 
-    # ── 6b. Créer la facture et la lier à la réservation ───
+    # ── 6b. Créer la facture avec détail fiscal ────────────
     numero_facture = await _generate_numero_facture(session)
     facture_vis = Facture(
-        numero         = numero_facture,
-        montant_total  = total_ttc,
-        statut         = StatutFacture.PAYEE,
-        id_reservation = None,
+        numero            = numero_facture,
+        montant_total     = fiscal.total_ttc,
+        montant_ht        = fiscal.montant_ht,
+        taxe_sejour       = fiscal.taxe_sejour,
+        tva_montant       = fiscal.tva_montant,
+        taux_tva          = fiscal.taux_tva,
+        droit_timbre      = fiscal.droit_timbre,
+        nb_nuits_taxables = fiscal.nb_nuits_taxables,
+        statut            = StatutFacture.PAYEE,
+        id_reservation    = None,
     )
     session.add(facture_vis)
     await session.flush()
@@ -240,8 +270,8 @@ async def reserver_visiteur(
     await session.refresh(resa)
 
     # ── 7. Charger les infos hôtel pour la réponse + email ─
-    h_res = await session.execute(_sel(_H).where(_H.id == chambre.id_hotel))
-    hotel = h_res.scalar_one_or_none()
+    h_res2 = await session.execute(_sel(_H).where(_H.id == chambre.id_hotel))
+    hotel  = h_res2.scalar_one_or_none()
 
     chambre_nom = chambre.type_chambre.nom if chambre.type_chambre else "Chambre"
     hotel_nom   = hotel.nom   if hotel else "Hôtel"
@@ -287,7 +317,7 @@ async def reserver_visiteur(
         )
     )
 
-    # ── 10. Retourner la réponse ─────────────────────────────
+    # ── 10. Retourner la réponse ────────────────────────────
     return VisiteurReservationResponse(
         id             = resa.id,
         numero_voucher = numero_voucher,
@@ -348,7 +378,6 @@ async def list_all_reservations(
 # ══════════════════════════════════════════════════════════
 
 class ReservationAdminItem(_BM):
-    """Représente une réservation unifiée — client ou visiteur."""
     id:                  int
     source:              str
     date_reservation:    str
@@ -382,7 +411,6 @@ class ReservationAdminListResponse(_BM):
 
 
 async def _get_hotel_info(id_chambre: int, session) -> tuple:
-    """Retourne (hotel_nom, hotel_ville) depuis un id_chambre."""
     from app.models.hotel import Hotel as _H
     ch_r = await session.execute(_sel(_Ch).where(_Ch.id == id_chambre))
     ch   = ch_r.scalar_one_or_none()
@@ -495,9 +523,8 @@ async def list_reservations_enrichi(
 
         for vis in visiteurs:
             hotel_nom, hotel_ville = await _get_hotel_info(vis.id_chambre, session)
-
-            num_fac  = vis.facture.numero         if vis.facture else None
-            stat_fac = vis.facture.statut.value   if vis.facture else None
+            num_fac  = vis.facture.numero       if vis.facture else None
+            stat_fac = vis.facture.statut.value if vis.facture else None
 
             items.append(ReservationAdminItem(
                 id                 = vis.id,
@@ -724,9 +751,9 @@ async def partenaire_mes_hotels(
 async def partenaire_reservations_hotel(
     hotel_id:       int,
     source:         Optional[str] = Query(None, description="client | visiteur"),
-    statut:         Optional[str] = Query(None, description="EN_ATTENTE | CONFIRMEE | ANNULEE | TERMINEE"),
-    search:         Optional[str] = Query(None, description="Nom, prénom, email ou téléphone"),
-    numero_facture: Optional[str] = Query(None, description="Numéro de facture (clients) ou voucher (visiteurs)"),
+    statut:         Optional[str] = Query(None),
+    search:         Optional[str] = Query(None),
+    numero_facture: Optional[str] = Query(None),
     session:        AsyncSession  = Depends(get_db),
     token:          TokenData     = Depends(require_partenaire),
 ):
@@ -742,7 +769,6 @@ async def partenaire_reservations_hotel(
     hotel_nom = hotel.nom if hotel else f"Hôtel #{hotel_id}"
 
     chambre_ids = await _get_chambre_ids_hotel(hotel_id, session)
-
     items: List[PartenaireResaItem] = []
 
     if not chambre_ids:
@@ -843,9 +869,7 @@ async def partenaire_reservations_hotel(
         for vis in visiteurs:
             if search:
                 s = search.lower()
-                haystack = (
-                    f"{vis.nom} {vis.prenom} {vis.email} {vis.telephone or ''}"
-                ).lower()
+                haystack = f"{vis.nom} {vis.prenom} {vis.email} {vis.telephone or ''}".lower()
                 if s not in haystack:
                     continue
 
@@ -927,7 +951,7 @@ async def payer_reservation(
 
 
 # ══════════════════════════════════════════════════════════
-#  ANNULER — CLIENT ou ADMIN (réservations clients)
+#  ANNULER — CLIENT ou ADMIN
 # ══════════════════════════════════════════════════════════
 @router.post("/{reservation_id}/annuler", response_model=ReservationResponse,
              summary="Annuler une réservation [CLIENT|ADMIN]")
@@ -1069,27 +1093,8 @@ def _generate_voucher_pdf(**kw) -> bytes:
         return buf.getvalue()
 
     except ImportError:
-        lines = [
-            f"EasyVoyage - Voucher N: {kw.get('numero','?')}",
-            f"Client: {kw.get('nom','?')}",
-            f"Email: {kw.get('email','?')}",
-        ]
-        if kw.get("type_resa") == "voyage":
-            lines += [
-                f"Voyage: {kw.get('voyage_titre','?')}",
-                f"Destination: {kw.get('destination','?')}",
-                f"Depart: {kw.get('date_debut','?')}",
-                f"Retour: {kw.get('date_fin','?')}",
-                f"Personnes: {kw.get('nb_personnes',1)}",
-            ]
-        else:
-            lines += [
-                f"Hotel: {kw.get('hotel_nom','?')}",
-                f"Chambre: {kw.get('chambre_nom','?')}",
-                f"Arrivee: {kw.get('date_debut','?')}",
-                f"Depart: {kw.get('date_fin','?')}",
-                f"Nuits: {kw.get('nb_nuits',0)}",
-            ]
+        lines = [f"EasyVoyage - Voucher N: {kw.get('numero','?')}",
+                 f"Client: {kw.get('nom','?')}", f"Email: {kw.get('email','?')}"]
         lines.append(f"Montant: {kw.get('montant',0):.2f} DT")
         return "\n".join(lines).encode("utf-8")
 
@@ -1110,20 +1115,15 @@ async def download_voucher_visiteur(
     from app.models.hotel import Hotel as _H
 
     ch_res  = await session.execute(
-        _sel(_Ch)
-        .options(_sil(_Ch.type_chambre))
-        .where(_Ch.id == resa.id_chambre)
+        _sel(_Ch).options(_sil(_Ch.type_chambre)).where(_Ch.id == resa.id_chambre)
     )
     chambre = ch_res.scalar_one_or_none()
-
-    hotel = None
+    hotel   = None
     if chambre:
         h_res = await session.execute(_sel(_H).where(_H.id == chambre.id_hotel))
         hotel = h_res.scalar_one_or_none()
 
-    chambre_nom = "Chambre"
-    if chambre and chambre.type_chambre:
-        chambre_nom = chambre.type_chambre.nom
+    chambre_nom = chambre.type_chambre.nom if (chambre and chambre.type_chambre) else "Chambre"
 
     pdf_bytes = _generate_voucher_pdf(
         type_resa   = "hotel",
@@ -1151,6 +1151,7 @@ async def download_voucher_visiteur(
 
 # ══════════════════════════════════════════════════════════
 #  FACTURE PDF — VISITEUR HÔTEL [ADMIN]
+#  Utilise les données fiscales stockées en base
 # ══════════════════════════════════════════════════════════
 @router.get("/visiteur/{voucher_num}/facture-pdf", summary="Facture PDF visiteur [ADMIN]")
 async def download_facture_visiteur_admin(
@@ -1179,14 +1180,18 @@ async def download_facture_visiteur_admin(
         h_res = await session.execute(_sel(_H).where(_H.id == chambre.id_hotel))
         hotel = h_res.scalar_one_or_none()
 
-    chambre_nom  = chambre.type_chambre.nom if (chambre and chambre.type_chambre) else "Chambre"
-    hotel_nom    = hotel.nom if hotel else "—"
-    nb_nuits     = max((resa.date_fin - resa.date_debut).days, 1)
-    total_ttc    = float(resa.total_ttc)
-    prix_ht_nuit = round((total_ttc / 1.19) / nb_nuits, 3)
-
+    chambre_nom   = chambre.type_chambre.nom if (chambre and chambre.type_chambre) else "Chambre"
+    hotel_nom     = hotel.nom if hotel else "—"
+    nb_nuits      = max((resa.date_fin - resa.date_debut).days, 1)
+    total_ttc_val = float(resa.total_ttc)
     num_doc       = resa.facture.numero if resa.facture else resa.numero_voucher
     date_emission = getattr(resa, "created_at", None) or datetime.now()
+
+    # ── Prix HT unitaire pour la ligne prestations ─────────
+    # Utiliser montant_ht stocké si disponible (nouvelle facture),
+    # sinon fallback sur total_ttc / 1.07 (ancienne facture sans détail fiscal)
+    montant_ht_val = float(resa.montant_ht) if resa.montant_ht else round(total_ttc_val / 1.07, 3)
+    prix_ht_nuit   = round(montant_ht_val / nb_nuits, 3)
 
     prestations = [{
         "type":          "chambre",
@@ -1196,19 +1201,27 @@ async def download_facture_visiteur_admin(
         "quantite":      nb_nuits,
     }]
 
+    # ── Paramètres fiscaux depuis la DB (None si ancienne réservation) ────────
     pdf_bytes = generer_facture_pdf(
-        numero_facture   = num_doc,
-        date_emission    = date_emission,
-        statut_facture   = "PAYEE",
-        client_nom       = resa.nom,
-        client_prenom    = resa.prenom,
-        client_email     = resa.email,
-        client_telephone = getattr(resa, "telephone", None),
-        date_debut       = resa.date_debut.strftime("%d/%m/%Y"),
-        date_fin         = resa.date_fin.strftime("%d/%m/%Y"),
-        nb_nuits         = nb_nuits,
-        prestations      = prestations,
-        total_ttc        = total_ttc,
+        numero_facture    = num_doc,
+        date_emission     = date_emission,
+        statut_facture    = "PAYEE",
+        client_nom        = resa.nom,
+        client_prenom     = resa.prenom,
+        client_email      = resa.email,
+        client_telephone  = getattr(resa, "telephone", None),
+        date_debut        = resa.date_debut.strftime("%d/%m/%Y"),
+        date_fin          = resa.date_fin.strftime("%d/%m/%Y"),
+        nb_nuits          = nb_nuits,
+        prestations       = prestations,
+        total_ttc         = total_ttc_val,
+        # ── Détail fiscal dynamique ────────────────────────
+        montant_ht        = float(resa.montant_ht)        if resa.montant_ht        else None,
+        taxe_sejour       = float(resa.taxe_sejour)       if resa.taxe_sejour       else None,
+        nb_nuits_taxables = resa.nb_nuits_taxables,
+        taux_tva          = float(resa.taux_tva)          if resa.taux_tva          else None,
+        tva_montant       = float(resa.tva_montant)       if resa.tva_montant       else None,
+        droit_timbre      = float(resa.droit_timbre)      if resa.droit_timbre      else None,
     )
 
     filename = f"facture-{num_doc}.pdf"
@@ -1232,22 +1245,17 @@ async def annuler_reservation_visiteur(
     _token: TokenData = Depends(require_admin),
 ):
     res  = await session.execute(
-        _sel(_RV)
-        .options(_sil(_RV.facture))
-        .where(_RV.id == visiteur_id)
+        _sel(_RV).options(_sil(_RV.facture)).where(_RV.id == visiteur_id)
     )
     resa = res.scalar_one_or_none()
     if not resa:
         raise HTTPException(404, "Réservation visiteur introuvable")
-
     if resa.statut == "ANNULEE":
         raise HTTPException(409, "Cette réservation est déjà annulée")
-
     if resa.statut == "TERMINEE":
         raise HTTPException(409, "Impossible d'annuler une réservation terminée")
 
     resa.statut = "ANNULEE"
-
     if resa.facture:
         resa.facture.statut = StatutFacture.ANNULEE
 
@@ -1271,7 +1279,7 @@ async def download_voucher_client(
     session: AsyncSession = Depends(get_db),
     token=Depends(get_current_user),
 ):
-    from app.models.hotel import Hotel as _H, Chambre as _Ch2
+    from app.models.hotel import Hotel as _H
     from app.models.utilisateur import Utilisateur as _Usr
 
     resa_res = await session.execute(
@@ -1332,9 +1340,7 @@ async def download_voucher_client(
             nb_enfants = lc.nb_enfants
 
             ch_res = await session.execute(
-                _sel(_Ch)
-                .options(_sil(_Ch.type_chambre))
-                .where(_Ch.id == lc.id_chambre)
+                _sel(_Ch).options(_sil(_Ch.type_chambre)).where(_Ch.id == lc.id_chambre)
             )
             ch = ch_res.scalar_one_or_none()
             if ch:
@@ -1366,7 +1372,5 @@ async def download_voucher_client(
     return _SR(
         _io.BytesIO(pdf_bytes),
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'attachment; filename="voucher-{reservation_id}.pdf"'
-        },
+        headers={"Content-Disposition": f'attachment; filename="voucher-{reservation_id}.pdf"'},
     )

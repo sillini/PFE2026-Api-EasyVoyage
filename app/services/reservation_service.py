@@ -13,6 +13,7 @@ Deux types de réservation distincts :
 
 Flux paiement :
   EN_ATTENTE → payer()   → CONFIRMEE + facture FAC-YYYY-XXXXX créée automatiquement
+                            + calcul fiscal dynamique (taxe séjour, TVA, timbre)
   CONFIRMEE  → annuler() → ANNULEE   (facture → ANNULEE)
   CONFIRMEE  → PostgreSQL scheduler  → TERMINEE (quand date_fin < aujourd'hui)
 """
@@ -84,7 +85,6 @@ def _nb_personnes_from_resa(resa: Reservation, voyage: Voyage) -> int:
     nb = (resa.nb_adultes or 0) + (resa.nb_enfants or 0)
     if nb > 0:
         return nb
-    # Fallback pour les réservations créées avant la migration
     prix = float(voyage.prix_base)
     if prix > 0:
         return max(1, round(float(resa.total_ttc) / prix))
@@ -181,7 +181,6 @@ async def create_reservation_chambres(
     total_ttc = Σ (tarif × nb_nuits) pour chaque chambre, avec application
     automatique de la promotion active de l'hôtel si elle existe.
     """
-    # Import local pour éviter les imports circulaires
     from app.services.promotion_service import (
         get_promotion_active_hotel,
         calculer_prix_promo,
@@ -201,12 +200,9 @@ async def create_reservation_chambres(
     await session.flush()
 
     total_ttc = 0.0
-
-    # ── Cache des promotions par hôtel (évite de requêter plusieurs fois) ──
     promo_cache: dict = {}
 
     async def _get_promo_for_hotel(hotel_id: int):
-        """Retourne la promo active de l'hôtel (avec cache)."""
         if hotel_id not in promo_cache:
             promo_cache[hotel_id] = await get_promotion_active_hotel(
                 hotel_id, session, at_date=data.date_debut
@@ -241,10 +237,7 @@ async def create_reservation_chambres(
                 f"sur la période {data.date_debut} → {data.date_fin}"
             )
 
-        # ── Prix de base ──────────────────────────────────
         prix_base = float(tarif.prix) * nb_nuits
-
-        # ── Application de la promotion active si elle existe ──
         promo = await _get_promo_for_hotel(chambre.id_hotel)
         if promo:
             prix_unitaire = calculer_prix_promo(prix_base, float(promo.pourcentage))
@@ -277,7 +270,7 @@ async def create_reservation_chambres(
 
 
 # ═══════════════════════════════════════════════════════════
-#  PAIEMENT → CONFIRMEE + FACTURE AUTO
+#  PAIEMENT → CONFIRMEE + FACTURE AUTO + CALCUL FISCAL
 #  ► Pour voyage : incrémente nb_inscrits du voyage
 # ═══════════════════════════════════════════════════════════
 async def payer_reservation(
@@ -298,7 +291,7 @@ async def payer_reservation(
     if resa.statut == StatutReservation.TERMINEE:
         raise ConflictException("Impossible de payer une réservation terminée")
 
-    # ── Voyage : vérifier à nouveau la capacité et incrémenter nb_inscrits ──
+    # ── Voyage : vérifier capacité et incrémenter nb_inscrits ────────────────
     if resa.id_voyage:
         v_result = await session.execute(
             select(Voyage).where(Voyage.id == resa.id_voyage)
@@ -313,32 +306,68 @@ async def payer_reservation(
                     f"Plus assez de places disponibles : il reste {places_restantes} place(s), "
                     f"vous demandez {nb_personnes}."
                 )
-
-            # ── Incrémenter nb_inscrits ──────────────────────────────────────
             voyage.nb_inscrits = (voyage.nb_inscrits or 0) + nb_personnes
             await session.flush()
 
-    # 1. Confirmer la réservation
-    resa.statut = StatutReservation.CONFIRMEE
+    # ── Calcul fiscal dynamique ───────────────────────────────────────────────
+    from app.services.fiscal_service import calculer_fiscal, calculer_fiscal_voyage
 
-    # 2. Créer la facture
+    nb_nuits = _nb_nuits(resa.date_debut, resa.date_fin)
+
+    if resa.id_voyage:
+        # Voyage : TVA + droit de timbre uniquement (pas de taxe de séjour)
+        fiscal = await calculer_fiscal_voyage(
+            montant_ht = float(resa.total_ttc),
+            session    = session,
+        )
+    else:
+        # Chambre hôtel : récupérer les étoiles pour appliquer la bonne taxe de séjour
+        etoiles = 3  # valeur par défaut
+        if resa.lignes_chambres:
+            ch_res = await session.execute(
+                select(Chambre)
+                .options(selectinload(Chambre.hotel))
+                .where(Chambre.id == resa.lignes_chambres[0].id_chambre)
+            )
+            chambre_obj = ch_res.scalar_one_or_none()
+            if chambre_obj and chambre_obj.hotel:
+                etoiles = chambre_obj.hotel.etoiles
+
+        fiscal = await calculer_fiscal(
+            montant_ht    = float(resa.total_ttc),
+            nb_nuits      = nb_nuits,
+            etoiles_hotel = etoiles,
+            session       = session,
+        )
+
+    # 1. Confirmer la réservation et mettre à jour le total TTC
+    resa.statut    = StatutReservation.CONFIRMEE
+    resa.total_ttc = fiscal.total_ttc
+
+    # 2. Créer la facture avec détail fiscal complet
     numero  = await _generate_numero_facture(session)
     facture = Facture(
-        numero=numero,
-        montant_total=resa.total_ttc,
-        statut=StatutFacture.EMISE,
-        id_reservation=resa.id,
+        numero            = numero,
+        montant_total     = fiscal.total_ttc,
+        montant_ht        = fiscal.montant_ht,
+        taxe_sejour       = fiscal.taxe_sejour,
+        tva_montant       = fiscal.tva_montant,
+        taux_tva          = fiscal.taux_tva,
+        droit_timbre      = fiscal.droit_timbre,
+        nb_nuits_taxables = fiscal.nb_nuits_taxables,
+        statut            = StatutFacture.EMISE,
+        id_reservation    = resa.id,
     )
     session.add(facture)
     await session.flush()
 
     # 3. Enregistrer le paiement
     paiement_obj = Paiement(
-        montant=resa.total_ttc,
-        methode=MethodePaiement(data.methode),
-        statut=StatutPaiement.CONFIRME,
-        transaction_id=data.transaction_id,
-        id_facture=facture.id,
+        montant        = fiscal.total_ttc,
+        methode        = MethodePaiement(data.methode),
+        statut         = StatutPaiement.CONFIRME,
+        transaction_id = data.transaction_id,
+        id_facture     = facture.id,
     )
     session.add(paiement_obj)
     facture.statut = StatutFacture.PAYEE
@@ -377,7 +406,6 @@ async def annuler_reservation(
         voyage = v_result.scalar_one_or_none()
         if voyage:
             nb_personnes = _nb_personnes_from_resa(resa, voyage)
-            # Ne pas descendre en dessous de 0
             voyage.nb_inscrits = max(0, (voyage.nb_inscrits or 0) - nb_personnes)
             await session.flush()
 
