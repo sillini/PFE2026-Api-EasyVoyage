@@ -26,6 +26,8 @@ from app.api.v1.endpoints.demandes_partenaire import (
     public_router as demandes_public_router,
     admin_router  as demandes_admin_router,
 )
+from app.api.v1.endpoints import hotel_ai_analysis
+from app.api.v1.endpoints import promotions
 
 api_v1_router = APIRouter(prefix="/api/v1")
 
@@ -57,3 +59,5 @@ api_v1_router.include_router(facebook_interactions.router)  # ← NOUVEAU
 api_v1_router.include_router(publication_facebook.router)
 
 api_v1_router.include_router(catalogue.router)
+api_v1_router.include_router(hotel_ai_analysis.router)
+api_v1_router.include_router(promotions.router)

@@ -9,7 +9,7 @@ ORM models pour :
 """
 import enum
 from datetime import date, datetime
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import (
     BigInteger, Boolean, Date, DateTime, Enum,
@@ -19,6 +19,9 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+if TYPE_CHECKING:
+    from app.models.promotion import Promotion
 
 
 # ── Hotel ─────────────────────────────────────────────────────────────────────
@@ -47,6 +50,14 @@ class Hotel(Base):
     avis:       Mapped[list["Avis"]]    = relationship("Avis",    back_populates="hotel")
     partenaire: Mapped[Optional["Utilisateur"]] = relationship(  # type: ignore[name-defined]
         "Utilisateur", foreign_keys=[id_partenaire], lazy="select",
+    )
+
+    # ── NOUVELLE RELATION : promotions ────────────────────────────────────────
+    promotions: Mapped[list["Promotion"]] = relationship(
+        "Promotion",
+        back_populates="hotel",
+        cascade="all, delete-orphan",
+        lazy="select",
     )
 
     def __repr__(self) -> str:
@@ -113,9 +124,7 @@ class Chambre(Base):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     id_hotel: Mapped[int] = mapped_column(BigInteger, ForeignKey("hotel.id", ondelete="CASCADE"), nullable=False)
     id_type_chambre: Mapped[int] = mapped_column(BigInteger, ForeignKey("type_chambre.id", ondelete="RESTRICT"), nullable=False)
-    # ── NOUVEAU CHAMP ─────────────────────────────────────────────────────────
     nb_chambres: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    # ─────────────────────────────────────────────────────────────────────────
     actif: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

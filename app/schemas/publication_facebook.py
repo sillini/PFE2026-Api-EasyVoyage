@@ -116,6 +116,9 @@ class SyncAllResponse(BaseModel):
 # ═══════════════════════════════════════════════════════════
 #  DASHBOARD — RESPONSE GLOBAL
 # ═══════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#  DASHBOARD — RESPONSE GLOBAL
+# ═══════════════════════════════════════════════════════════
 class DashboardResponse(BaseModel):
     # Compteurs de publications
     total_publications: int = 0
@@ -131,19 +134,22 @@ class DashboardResponse(BaseModel):
     total_reach:       int = 0
     total_impressions: int = 0
 
-    # Top publication (la plus engagée)
-    top_post_id:         Optional[int] = None
-    top_post_fb_id:      Optional[str] = None
-    top_post_message:    Optional[str] = None
-    top_post_likes:      int = 0
-    top_post_engagement: int = 0
+    # Top publication (la plus engagée) — ENRICHI
+    top_post_id:            Optional[int]      = None
+    top_post_fb_id:         Optional[str]      = None
+    top_post_message:       Optional[str]      = None
+    top_post_image_url:     Optional[str]      = None
+    top_post_type:          Optional[str]      = None
+    top_post_published_at:  Optional[datetime] = None
+    top_post_likes:         int = 0
+    top_post_comments:      int = 0
+    top_post_shares:        int = 0
+    top_post_engagement:    int = 0
 
-    # Taux d'engagement moyen (interactions / reach * 100)
+    # Taux d'engagement moyen
     avg_engagement_rate: float = 0.0
 
-    # Dernière synchronisation
     last_sync_at: Optional[datetime] = None
-
 
 # ═══════════════════════════════════════════════════════════
 #  FACEBOOK CONFIG — UPDATE

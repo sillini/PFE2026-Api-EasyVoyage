@@ -102,6 +102,16 @@ class HotelResponse(BaseModel):
     partenaire:    Optional[PartenaireInfo] = None
     created_at:    datetime
     updated_at:    datetime
+
+    # ── NOUVEAUX CHAMPS PROMOTION ────────────────────────
+    prix_min:              Optional[float] = None   # prix le plus bas (avant promo)
+    prix_min_promo:        Optional[float] = None   # prix après réduction
+    promotion_active:      bool            = False  # True si promo en cours
+    promotion_pourcentage: Optional[float] = None   # ex: 20.0 pour -20%
+    promotion_titre:       Optional[str]   = None   # ex: "Offre d'été"
+    promotion_type:        Optional[str]   = None   # STANDARD | EARLY_BOOKING | LAST_MINUTE
+    promotion_date_fin:    Optional[date]  = None   # date de fin de la promo
+
     model_config = {"from_attributes": True}
 
 

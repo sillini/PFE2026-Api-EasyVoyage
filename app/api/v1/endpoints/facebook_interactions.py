@@ -5,10 +5,6 @@
 #  POST  /admin/facebook/publications/{id}/sync-stats   → Sync 1 publication
 #  POST  /admin/facebook/publications/sync-all-stats    → Sync toutes les publiées
 #  GET   /admin/facebook/dashboard                      → Dashboard global
-#
-#  CORRECTION : On n'utilise QUE les champs de base (reactions, comments, shares)
-#  qui fonctionnent avec n'importe quel Page Access Token.
-#  Les "insights" nécessitent pages_read_insights (permission avancée Meta).
 # ══════════════════════════════════════════════════════════════════════════
 
 from datetime import datetime, timezone
@@ -16,7 +12,7 @@ from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select, func
+from sqlalchemy import select, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dependencies import require_admin
@@ -36,21 +32,11 @@ router = APIRouter(
 )
 
 
-# ─── Helper : appel Graph API (champs de base uniquement) ───────────────────
+# ─── Helper : appel Graph API ───────────────────────────────────────────────
 
 async def _fetch_post_stats(fb_post_id: str, access_token: str) -> dict:
     """
     Récupère les stats d'une publication via l'API Graph Facebook.
-
-    Champs utilisés (disponibles avec un Page Token standard) :
-      - reactions.summary(total_count)  → total réactions (👍❤️😂😮😢😡)
-      - comments.summary(total_count)   → nombre de commentaires
-      - shares                          → nombre de partages
-
-    NOTE : Les "insights" (portée, impressions, clics) nécessitent la permission
-    pages_read_insights — non demandée ici pour rester compatible avec les tokens
-    de base. Ces champs resteront à 0 sauf si vous activez cette permission sur
-    votre app Meta.
     """
     fields = (
         "reactions.summary(total_count).limit(0),"
@@ -70,14 +56,12 @@ async def _fetch_post_stats(fb_post_id: str, access_token: str) -> dict:
 
         body = resp.json()
 
-        # ── Vérifier les erreurs Graph API ────────────────
         if "error" in body:
             err = body["error"]
             code    = err.get("code", "?")
             message = err.get("message", "Erreur inconnue")
             subcode = err.get("error_subcode", "")
 
-            # Erreurs communes et leurs causes
             hints = {
                 190: "Token expiré ou invalide — renouvelez le token dans Config Facebook",
                 200: "Permission manquante — ajoutez pages_read_engagement à votre app Meta",
@@ -92,33 +76,26 @@ async def _fetch_post_stats(fb_post_id: str, access_token: str) -> dict:
 
             return {"error": detail}
 
-        # ── Extraire les valeurs ──────────────────────────
-
-        # Réactions (like + love + haha + wow + sad + angry)
         reactions_count = (
             body.get("reactions", {})
                 .get("summary", {})
                 .get("total_count", 0) or 0
         )
-
-        # Commentaires
         comments_count = (
             body.get("comments", {})
                 .get("summary", {})
                 .get("total_count", 0) or 0
         )
-
-        # Partages (peut être absent si 0)
         shares_count = body.get("shares", {}).get("count", 0) or 0
 
         return {
-            "likes_count":     reactions_count,   # likes ≃ réactions dans v19+
+            "likes_count":     reactions_count,
             "reactions_count": reactions_count,
             "comments_count":  comments_count,
             "shares_count":    shares_count,
-            "clicks_count":    0,                  # nécessite pages_read_insights
-            "reach_count":     0,                  # nécessite pages_read_insights
-            "impressions":     0,                  # nécessite pages_read_insights
+            "clicks_count":    0,
+            "reach_count":     0,
+            "impressions":     0,
             "error":           None,
         }
 
@@ -142,13 +119,8 @@ async def sync_post_stats(
     session: AsyncSession = Depends(get_db),
     _:       TokenData    = Depends(require_admin),
 ):
-    """
-    Appelle l'API Graph Facebook et met à jour les stats en BDD pour 1 publication.
-    Utilise uniquement les champs de base (reactions, comments, shares).
-    """
     pub = await pub_service.get_publication(pub_id, session)
 
-    # Pas de fb_post_id → impossible de sync
     if not pub.fb_post_id:
         return PostInteractionsResponse(
             id=pub.id,
@@ -160,7 +132,6 @@ async def sync_post_stats(
             error="Aucun fb_post_id — la publication n'a pas encore été publiée sur Facebook",
         )
 
-    # Récupérer le token Page depuis la BDD
     config = await pub_service.get_facebook_config(session)
     if not config or not config.page_access_token:
         raise HTTPException(
@@ -168,10 +139,8 @@ async def sync_post_stats(
             detail="Token Facebook non configuré — allez dans ⚙️ Config Facebook",
         )
 
-    # Appel Graph API
     stats = await _fetch_post_stats(pub.fb_post_id, config.page_access_token)
 
-    # Si erreur Graph → retourner les stats actuelles + message d'erreur
     if stats.get("error"):
         return PostInteractionsResponse(
             id=pub.id,
@@ -188,7 +157,6 @@ async def sync_post_stats(
             error=stats["error"],
         )
 
-    # ── Mise à jour en BDD ────────────────────────────────
     pub.likes_count      = stats["likes_count"]
     pub.comments_count   = stats["comments_count"]
     pub.shares_count     = stats["shares_count"]
@@ -226,9 +194,6 @@ async def sync_all_stats(
     session: AsyncSession = Depends(get_db),
     _:       TokenData    = Depends(require_admin),
 ):
-    """
-    Synchronise en masse toutes les publications PUBLISHED ayant un fb_post_id.
-    """
     config = await pub_service.get_facebook_config(session)
     if not config or not config.page_access_token:
         raise HTTPException(
@@ -291,10 +256,10 @@ async def get_dashboard(
         select(
             func.count(PublicationFacebook.id).label("total"),
             func.sum(
-                func.case((PublicationFacebook.statut == "PUBLISHED", 1), else_=0)
+                case((PublicationFacebook.statut == "PUBLISHED", 1), else_=0)
             ).label("published"),
             func.sum(
-                func.case((PublicationFacebook.statut == "DRAFT", 1), else_=0)
+                case((PublicationFacebook.statut == "DRAFT", 1), else_=0)
             ).label("draft"),
             func.coalesce(func.sum(PublicationFacebook.likes_count),     0).label("total_likes"),
             func.coalesce(func.sum(PublicationFacebook.comments_count),  0).label("total_comments"),
@@ -308,7 +273,6 @@ async def get_dashboard(
     )
     row = agg.first()
 
-    # Top publication par engagement total
     top_result = await session.execute(
         select(PublicationFacebook)
         .where(PublicationFacebook.statut == "PUBLISHED")
@@ -323,7 +287,6 @@ async def get_dashboard(
     )
     top = top_result.scalar_one_or_none()
 
-    # Taux d'engagement moyen
     total_reach      = row.total_reach or 0
     total_engagement = (row.total_reactions or 0) + (row.total_comments or 0) + (row.total_shares or 0)
     avg_engagement_rate = (
@@ -342,13 +305,21 @@ async def get_dashboard(
         total_clicks        = row.total_clicks     or 0,
         total_reach         = row.total_reach      or 0,
         total_impressions   = row.total_impressions or 0,
-        top_post_id         = top.id          if top else None,
-        top_post_fb_id      = top.fb_post_id  if top else None,
-        top_post_message    = (top.message[:120] + "…") if top and len(top.message) > 120 else (top.message if top else None),
-        top_post_likes      = (top.reactions_count or 0) if top else 0,
-        top_post_engagement = (
+
+        # ── Top publication enrichie ──
+        top_post_id           = top.id          if top else None,
+        top_post_fb_id        = top.fb_post_id  if top else None,
+        top_post_message      = top.message     if top else None,
+        top_post_image_url    = top.image_url   if top else None,
+        top_post_type         = top.type_contenu if top else None,
+        top_post_published_at = top.published_at if top else None,
+        top_post_likes        = (top.reactions_count or 0) if top else 0,
+        top_post_comments     = (top.comments_count  or 0) if top else 0,
+        top_post_shares       = (top.shares_count    or 0) if top else 0,
+        top_post_engagement   = (
             (top.reactions_count or 0) + (top.comments_count or 0) + (top.shares_count or 0)
         ) if top else 0,
+
         avg_engagement_rate = avg_engagement_rate,
         last_sync_at        = row.last_sync,
     )

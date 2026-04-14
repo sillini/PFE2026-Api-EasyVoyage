@@ -1,11 +1,14 @@
 """
-app/services/hotel_service.py — VERSION STOCK
+app/services/hotel_service.py — VERSION STOCK + PROMOTIONS
 
 Logique de disponibilité par stock :
   - Chambre.nb_chambres = nombre total de chambres de ce type dans cet hôtel
   - nb_reservees = COUNT des réservations CONFIRMEES qui chevauchent la période
   - nb_disponibles = nb_chambres - nb_reservees
   - disponible = nb_disponibles > 0
+
+Enrichissement automatique avec promotions :
+  - Chaque HotelResponse contient prix_min, prix_min_promo, promotion_active, etc.
 """
 from collections import defaultdict
 from datetime import date
@@ -29,10 +32,72 @@ from app.schemas.hotel import (
 
 
 # ═══════════════════════════════════════════════════════════
+#  HELPERS INTERNES — PROMOTIONS
+# ═══════════════════════════════════════════════════════════
+
+async def _get_prix_min_hotel(hotel_id: int, session: AsyncSession) -> Optional[float]:
+    """
+    Retourne le prix minimum courant d'un hôtel en parcourant
+    les tarifs actifs aujourd'hui pour toutes ses chambres actives.
+    """
+    today = date.today()
+    row = (await session.execute(
+        select(func.min(Tarif.prix))
+        .join(Chambre, Tarif.id_chambre == Chambre.id)
+        .where(
+            Chambre.id_hotel == hotel_id,
+            Chambre.actif == True,
+            Tarif.date_debut <= today,
+            Tarif.date_fin   >= today,
+        )
+    )).scalar_one_or_none()
+    return float(row) if row is not None else None
+
+
+async def _get_prix_min_multi_hotels(
+    hotel_ids: list[int], session: AsyncSession
+) -> dict:
+    """
+    Optimisation : récupère en UNE requête le prix min de plusieurs hôtels.
+    Retourne un dict {hotel_id: prix_min}.
+    """
+    if not hotel_ids:
+        return {}
+
+    today = date.today()
+    result = await session.execute(
+        select(
+            Chambre.id_hotel,
+            func.min(Tarif.prix).label("prix_min"),
+        )
+        .join(Tarif, Tarif.id_chambre == Chambre.id)
+        .where(
+            Chambre.id_hotel.in_(hotel_ids),
+            Chambre.actif == True,
+            Tarif.date_debut <= today,
+            Tarif.date_fin   >= today,
+        )
+        .group_by(Chambre.id_hotel)
+    )
+    return {row.id_hotel: float(row.prix_min) for row in result.all()}
+
+
+# ═══════════════════════════════════════════════════════════
 #  HELPERS INTERNES
 # ═══════════════════════════════════════════════════════════
 
-def _to_hotel_response(hotel: Hotel) -> HotelResponse:
+def _to_hotel_response(
+    hotel: Hotel,
+    prix_min: Optional[float] = None,
+    promo=None,  # Promotion ou None
+) -> HotelResponse:
+    """
+    Convertit un Hotel ORM en HotelResponse, avec injection optionnelle
+    des données de promotion et du prix minimum.
+    """
+    # Import local pour éviter les imports circulaires
+    from app.services.promotion_service import calculer_prix_promo
+
     partenaire_info = None
     if hotel.partenaire:
         partenaire_info = PartenaireInfo(
@@ -41,6 +106,27 @@ def _to_hotel_response(hotel: Hotel) -> HotelResponse:
             prenom=hotel.partenaire.prenom,
             email=hotel.partenaire.email,
         )
+
+    # ── Calcul promotion ────────────────────────────────
+    prix_min_promo        = None
+    promotion_active      = False
+    promotion_pourcentage = None
+    promotion_titre       = None
+    promotion_type        = None
+    promotion_date_fin    = None
+
+    if promo and prix_min is not None and prix_min > 0:
+        prix_min_promo        = calculer_prix_promo(prix_min, float(promo.pourcentage))
+        promotion_active      = True
+        promotion_pourcentage = float(promo.pourcentage)
+        promotion_titre       = promo.titre
+        promotion_type        = (
+            promo.type_promotion.value
+            if hasattr(promo.type_promotion, "value")
+            else str(promo.type_promotion)
+        )
+        promotion_date_fin    = promo.date_fin
+
     return HotelResponse(
         id=hotel.id,
         nom=hotel.nom,
@@ -56,7 +142,42 @@ def _to_hotel_response(hotel: Hotel) -> HotelResponse:
         partenaire=partenaire_info,
         created_at=hotel.created_at,
         updated_at=hotel.updated_at,
+        prix_min=prix_min,
+        prix_min_promo=prix_min_promo,
+        promotion_active=promotion_active,
+        promotion_pourcentage=promotion_pourcentage,
+        promotion_titre=promotion_titre,
+        promotion_type=promotion_type,
+        promotion_date_fin=promotion_date_fin,
     )
+
+
+async def _enrichir_hotels(
+    hotels_list: list[Hotel], session: AsyncSession
+) -> list[HotelResponse]:
+    """
+    Enrichit une liste d'hôtels avec les données de prix et promotions
+    en un minimum de requêtes SQL.
+    """
+    from app.services.promotion_service import get_promotions_actives_multi_hotels
+
+    hotel_ids = [h.id for h in hotels_list]
+
+    # 1. Récupère tous les prix min en UNE requête
+    prix_by_hotel = await _get_prix_min_multi_hotels(hotel_ids, session)
+
+    # 2. Récupère toutes les promos actives en UNE requête
+    promos_by_hotel = await get_promotions_actives_multi_hotels(hotel_ids, session)
+
+    # 3. Construit les réponses enrichies
+    return [
+        _to_hotel_response(
+            h,
+            prix_min=prix_by_hotel.get(h.id),
+            promo=promos_by_hotel.get(h.id),
+        )
+        for h in hotels_list
+    ]
 
 
 async def _get_prix_courant(chambre_id: int, session: AsyncSession):
@@ -174,19 +295,30 @@ async def list_hotels(
     query = query.order_by(Hotel.note_moyenne.desc(), Hotel.nom.asc())
     query = query.offset((page - 1) * per_page).limit(per_page)
     hotels = (await session.execute(query)).scalars().all()
+
+    # ── Enrichissement avec prix + promotions ──────────
+    items = await _enrichir_hotels(hotels, session)
+
     return HotelListResponse(
         total=total, page=page, per_page=per_page,
-        items=[_to_hotel_response(h) for h in hotels],
+        items=items,
     )
 
 
 async def get_hotel(hotel_id: int, session: AsyncSession) -> HotelResponse:
+    from app.services.promotion_service import get_promotion_active_hotel
+
     hotel = (await session.execute(
         select(Hotel).options(selectinload(Hotel.partenaire)).where(Hotel.id == hotel_id)
     )).scalar_one_or_none()
     if not hotel:
         raise NotFoundException(f"Hôtel {hotel_id} introuvable")
-    return _to_hotel_response(hotel)
+
+    # Enrichir avec prix + promo
+    prix_min = await _get_prix_min_hotel(hotel_id, session)
+    promo    = await get_promotion_active_hotel(hotel_id, session)
+
+    return _to_hotel_response(hotel, prix_min=prix_min, promo=promo)
 
 
 async def create_hotel(data: HotelCreate, session: AsyncSession, id_partenaire: Optional[int] = None) -> HotelResponse:
@@ -471,6 +603,8 @@ async def create_avis(hotel_id: int, data: AvisCreate, client_id: int, session: 
     await session.flush()
     utilisateur = await _get_utilisateur(client_id, session)
     return _to_avis_response(avis, utilisateur)
+
+
 async def delete_avis(
     hotel_id: int,
     avis_id: int,
@@ -497,169 +631,9 @@ async def delete_avis(
     await session.delete(avis)
     await session.flush()
 
+
 # ═══════════════════════════════════════════════════════════
 #  DISPONIBILITÉS — LOGIQUE PAR STOCK
-# ═══════════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════════
-    #  REMPLACER la fonction get_hotel_disponibilites dans
-    #  app/services/hotel_service.py par cette version complète
-    #
-    #  CORRECTION : comptabilise les réservations des DEUX tables
-    #    - reservation (clients) via LigneReservationChambre
-    #    - reservation_visiteur (visiteurs sans compte)
-    # ═══════════════════════════════════════════════════════════
-
-async def get_hotel_disponibilites(
-    hotel_id: int,
-    date_debut,
-    date_fin,
-    session: AsyncSession,
-    role: str = "ADMIN",   # "ADMIN" | "PARTENAIRE" | "PUBLIC"
-):
-    from app.models.reservation import (
-        Reservation, StatutReservation,
-        LigneReservationChambre, ReservationVisiteur,
-    )
-    from app.schemas.hotel import (
-        HotelDisponibilitesResponse, ChambreDisponibiliteResponse, OccupationPeriode,
-    )
-
-    await _check_hotel(hotel_id, session)
-
-    chambres = (await session.execute(
-        select(Chambre)
-        .options(selectinload(Chambre.type_chambre))
-        .where(Chambre.id_hotel == hotel_id, Chambre.actif == True)
-        .order_by(Chambre.id.asc())
-    )).scalars().all()
-
-    chambres_dispo = []
-    for ch in chambres:
-
-        # ── 1. Réservations CLIENTS (table reservation + ligne_reservation_chambre) ──
-        nb_clients = (await session.execute(
-            select(func.count())
-            .select_from(LigneReservationChambre)
-            .join(Reservation, Reservation.id == LigneReservationChambre.id_reservation)
-            .where(
-                LigneReservationChambre.id_chambre == ch.id,
-                Reservation.statut == StatutReservation.CONFIRMEE,
-                Reservation.date_debut < date_fin,
-                Reservation.date_fin   > date_debut,
-            )
-        )).scalar_one()
-
-        # ── 2. Réservations VISITEURS (table reservation_visiteur) ──────────────────
-        nb_visiteurs = (await session.execute(
-            select(func.count())
-            .select_from(ReservationVisiteur)
-            .where(
-                ReservationVisiteur.id_chambre == ch.id,
-                ReservationVisiteur.statut == "CONFIRMEE",
-                ReservationVisiteur.date_debut < date_fin,
-                ReservationVisiteur.date_fin   > date_debut,
-            )
-        )).scalar_one()
-
-        # ── 3. Total réservées = clients + visiteurs ─────────────────────────────────
-        nb_reservees   = nb_clients + nb_visiteurs
-        nb_total       = ch.nb_chambres
-        nb_disponibles = max(0, nb_total - nb_reservees)
-        is_available   = nb_disponibles > 0
-
-        # ── 4. Charger les occupations pour admin/partenaire ─────────────────────────
-        occupations = []
-        if role in ("ADMIN", "PARTENAIRE"):
-            # Occupations clients
-            resas_clients = (await session.execute(
-                select(Reservation)
-                .join(LigneReservationChambre, LigneReservationChambre.id_reservation == Reservation.id)
-                .where(
-                    LigneReservationChambre.id_chambre == ch.id,
-                    Reservation.statut == StatutReservation.CONFIRMEE,
-                    Reservation.date_debut < date_fin,
-                    Reservation.date_fin   > date_debut,
-                )
-                .order_by(Reservation.date_debut.asc())
-            )).scalars().all()
-
-            # Occupations visiteurs
-            resas_visiteurs = (await session.execute(
-                select(ReservationVisiteur)
-                .where(
-                    ReservationVisiteur.id_chambre == ch.id,
-                    ReservationVisiteur.statut == "CONFIRMEE",
-                    ReservationVisiteur.date_debut < date_fin,
-                    ReservationVisiteur.date_fin   > date_debut,
-                )
-                .order_by(ReservationVisiteur.date_debut.asc())
-            )).scalars().all()
-
-            occupations = [
-                OccupationPeriode(
-                    date_debut=r.date_debut,
-                    date_fin=r.date_fin,
-                    id_reservation=r.id,
-                )
-                for r in resas_clients
-            ] + [
-                OccupationPeriode(
-                    date_debut=r.date_debut,
-                    date_fin=r.date_fin,
-                    id_reservation=r.id,
-                )
-                for r in resas_visiteurs
-            ]
-            # Trier par date de début
-            occupations.sort(key=lambda o: o.date_debut)
-
-        # ── 5. Tarif courant ──────────────────────────────────────────────────────────
-        tarif = (await session.execute(
-            select(Tarif)
-            .where(
-                Tarif.id_chambre == ch.id,
-                Tarif.date_debut <= date_debut,
-                Tarif.date_fin   >= date_fin,
-            )
-            .order_by(Tarif.prix.asc()).limit(1)
-        )).scalar_one_or_none()
-
-        p = float(tarif.prix) if tarif else None
-
-        chambres_dispo.append(ChambreDisponibiliteResponse(
-            chambre_id=ch.id,
-            disponible=is_available,
-            nb_total=nb_total,
-            nb_reservees=nb_reservees,
-            nb_disponibles=nb_disponibles,
-            occupations=occupations,
-            prix_min=p,
-            prix_max=p,
-            type_chambre={
-                "id":  ch.type_chambre.id,
-                "nom": ch.type_chambre.nom,
-            } if ch.type_chambre else None,
-            capacite=ch.capacite,
-            description=ch.description,
-        ))
-
-    # ── Filtrage PUBLIC : masquer les types dont nb_disponibles == 0 ─────────────
-    if role == "PUBLIC":
-        chambres_dispo = [c for c in chambres_dispo if c.disponible]
-
-    return HotelDisponibilitesResponse(
-        hotel_id=hotel_id,
-        date_debut=date_debut,
-        date_fin=date_fin,
-        chambres=chambres_dispo,
-    )
-
-# ═══════════════════════════════════════════════════════════
-#  REMPLACER dans app/services/hotel_service.py
-#  la fonction get_hotel_disponibilites
-#  SEUL CHANGEMENT : ajout du paramètre capacite_min
-#  et filtre sur ch.capacite >= capacite_min
 # ═══════════════════════════════════════════════════════════
 
 async def get_hotel_disponibilites(
@@ -668,7 +642,7 @@ async def get_hotel_disponibilites(
     date_fin,
     session:      AsyncSession,
     role:         str          = "ADMIN",   # "ADMIN" | "PARTENAIRE" | "PUBLIC"
-    capacite_min: Optional[int] = None,     # ← NOUVEAU : filtre capacité
+    capacite_min: Optional[int] = None,     # filtre capacité
 ):
     from app.models.reservation import (
         Reservation, StatutReservation,
@@ -687,7 +661,7 @@ async def get_hotel_disponibilites(
         .where(Chambre.id_hotel == hotel_id, Chambre.actif == True)
     )
     if capacite_min is not None:
-        q = q.where(Chambre.capacite >= capacite_min)   # ← filtre capacité
+        q = q.where(Chambre.capacite >= capacite_min)
     q = q.order_by(Chambre.id.asc())
 
     chambres = (await session.execute(q)).scalars().all()
@@ -695,7 +669,7 @@ async def get_hotel_disponibilites(
     chambres_dispo = []
     for ch in chambres:
 
-        # ── 1. Réservations CLIENTS (table reservation + ligne_reservation_chambre) ──
+        # ── 1. Réservations CLIENTS ──────────────────────────────────────────
         nb_clients = (await session.execute(
             select(func.count())
             .select_from(LigneReservationChambre)
@@ -708,7 +682,7 @@ async def get_hotel_disponibilites(
             )
         )).scalar_one()
 
-        # ── 2. Réservations VISITEURS (table reservation_visiteur) ──────────────────
+        # ── 2. Réservations VISITEURS ────────────────────────────────────────
         nb_visiteurs = (await session.execute(
             select(func.count())
             .select_from(ReservationVisiteur)
@@ -720,13 +694,13 @@ async def get_hotel_disponibilites(
             )
         )).scalar_one()
 
-        # ── 3. Calcul stock ──────────────────────────────────────────────────────────
+        # ── 3. Calcul stock ──────────────────────────────────────────────────
         nb_reservees   = nb_clients + nb_visiteurs
         nb_total       = ch.nb_chambres
         nb_disponibles = max(0, nb_total - nb_reservees)
         is_available   = nb_disponibles > 0
 
-        # ── 4. Occupations détaillées (admin/partenaire seulement) ───────────────────
+        # ── 4. Occupations détaillées (admin/partenaire seulement) ───────────
         occupations = []
         if role in ("ADMIN", "PARTENAIRE"):
             resas_c = (await session.execute(
@@ -744,9 +718,9 @@ async def get_hotel_disponibilites(
                 occupations.append(OccupationPeriode(
                     date_debut=r.date_debut,
                     date_fin=r.date_fin,
-                    nb_reservees=1,
+                    id_reservation=r.id,
+                    numero_ref=r.facture.numero if r.facture else f"#{r.id}",
                     source="client",
-                    reservation_id=r.id,
                 ))
 
             resas_v = (await session.execute(
@@ -762,12 +736,14 @@ async def get_hotel_disponibilites(
                 occupations.append(OccupationPeriode(
                     date_debut=v.date_debut,
                     date_fin=v.date_fin,
-                    nb_reservees=1,
+                    id_reservation=v.id,
+                    numero_ref=v.numero_voucher,
                     source="visiteur",
-                    reservation_id=v.id,
                 ))
 
-        # ── 5. Tarif courant ─────────────────────────────────────────────────────────
+            occupations.sort(key=lambda o: o.date_debut)
+
+        # ── 5. Tarif courant ─────────────────────────────────────────────────
         tarif = (await session.execute(
             select(Tarif)
             .where(
@@ -797,7 +773,7 @@ async def get_hotel_disponibilites(
             description=ch.description,
         ))
 
-    # ── Filtrage PUBLIC : masquer les types dont nb_disponibles == 0 ─────────────
+    # ── Filtrage PUBLIC : masquer les types dont nb_disponibles == 0 ─────────
     if role == "PUBLIC":
         chambres_dispo = [c for c in chambres_dispo if c.disponible]
 
@@ -807,8 +783,8 @@ async def get_hotel_disponibilites(
         date_fin=date_fin,
         chambres=chambres_dispo,
     )
- 
- 
+
+
 async def get_chambre_disponibilite(
     hotel_id: int, chambre_id: int, date_debut, date_fin, session: AsyncSession
 ):
@@ -817,7 +793,7 @@ async def get_chambre_disponibilite(
         LigneReservationChambre, ReservationVisiteur,
     )
     from app.schemas.hotel import ChambreDisponibiliteResponse, OccupationPeriode
- 
+
     ch = (await session.execute(
         select(Chambre)
         .options(selectinload(Chambre.type_chambre))
@@ -825,7 +801,7 @@ async def get_chambre_disponibilite(
     )).scalar_one_or_none()
     if not ch:
         raise NotFoundException(f"Chambre {chambre_id} introuvable")
- 
+
     nb_clients = (await session.execute(
         select(func.count())
         .select_from(LigneReservationChambre)
@@ -837,7 +813,7 @@ async def get_chambre_disponibilite(
             Reservation.date_fin   > date_debut,
         )
     )).scalar_one()
- 
+
     nb_visiteurs = (await session.execute(
         select(func.count())
         .select_from(ReservationVisiteur)
@@ -848,11 +824,11 @@ async def get_chambre_disponibilite(
             ReservationVisiteur.date_fin   > date_debut,
         )
     )).scalar_one()
- 
+
     nb_reservees   = nb_clients + nb_visiteurs
     nb_total       = ch.nb_chambres
     nb_disponibles = max(0, nb_total - nb_reservees)
- 
+
     resas_c = (await session.execute(
         select(Reservation)
         .options(selectinload(Reservation.facture))
@@ -864,7 +840,7 @@ async def get_chambre_disponibilite(
             Reservation.date_fin   > date_debut,
         )
     )).scalars().all()
- 
+
     resas_v = (await session.execute(
         select(ReservationVisiteur)
         .where(
@@ -874,7 +850,7 @@ async def get_chambre_disponibilite(
             ReservationVisiteur.date_fin   > date_debut,
         )
     )).scalars().all()
- 
+
     occupations = sorted(
         [OccupationPeriode(
             date_debut=r.date_debut, date_fin=r.date_fin, id_reservation=r.id,
@@ -888,7 +864,7 @@ async def get_chambre_disponibilite(
         ) for r in resas_v],
         key=lambda o: o.date_debut,
     )
- 
+
     return ChambreDisponibiliteResponse(
         chambre_id=chambre_id,
         disponible=nb_disponibles > 0,
@@ -898,6 +874,8 @@ async def get_chambre_disponibilite(
         occupations=occupations,
         prix_min=None, prix_max=None,
     )
+
+
 # ═══════════════════════════════════════════════════════════
 #  MIS EN AVANT + VILLES VEDETTES
 # ═══════════════════════════════════════════════════════════
@@ -927,8 +905,14 @@ async def list_hotels_en_avant(session: AsyncSession) -> HotelListResponse:
             .order_by(Hotel.note_moyenne.desc(), Hotel.nom.asc())
             .limit(12)
         )).scalars().all()
-    return HotelListResponse(total=len(hotels), page=1, per_page=len(hotels),
-                             items=[_to_hotel_response(h) for h in hotels])
+
+    # ── Enrichissement avec prix + promotions ──────────
+    items = await _enrichir_hotels(hotels, session)
+
+    return HotelListResponse(
+        total=len(hotels), page=1, per_page=len(hotels),
+        items=items,
+    )
 
 
 async def list_villes_vedettes(session: AsyncSession, actif_only: bool = True):

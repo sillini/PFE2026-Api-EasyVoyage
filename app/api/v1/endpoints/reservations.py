@@ -7,6 +7,7 @@ Routes :
   POST  /reservations/visiteur                      → Réservation hôtel visiteur sans compte
                                                       + envoi automatique du voucher par email
                                                       + création automatique de la facture
+                                                      + application automatique des promotions
   GET   /reservations/mes-reservations              → Mes réservations [CLIENT]
   GET   /reservations                               → Toutes [ADMIN]
   GET   /reservations/admin/enrichi                 → Clients + Visiteurs enrichis [ADMIN]
@@ -55,7 +56,7 @@ from app.models.reservation import (
 from app.models.hotel import Chambre as _Ch, Tarif as _T
 from app.models.voyage import Voyage as _Voyage
 from app.services.email_service import send_voucher_email as _send_voucher_email
-from app.services.contact_service import upsert_contact   # ← NOUVEAU
+from app.services.contact_service import upsert_contact
 import app.services.reservation_service as reservation_service
 
 router = APIRouter(prefix="/reservations", tags=["Réservations"])
@@ -136,6 +137,11 @@ async def reserver_visiteur(
     from datetime import date as _date
     from app.models.hotel import Hotel as _H
     from app.services.reservation_service import _generate_numero_facture
+    # ── Import du service promotion ─────────────────────────
+    from app.services.promotion_service import (
+        get_promotion_active_hotel,
+        calculer_prix_promo,
+    )
 
     # ── 1. Valider les dates ───────────────────────────────
     try:
@@ -171,15 +177,22 @@ async def reserver_visiteur(
     if not tarif:
         raise HTTPException(422, f"Aucun tarif disponible pour la période {d1} → {d2}")
 
-    total_ttc = round(float(tarif.prix) * nb_nuits, 2)
+    # ── 4. Calcul du prix avec application automatique de la promo ──
+    prix_base = float(tarif.prix) * nb_nuits
 
-    # ── 4. Générer un numéro de voucher unique ─────────────
+    promo = await get_promotion_active_hotel(chambre.id_hotel, session, at_date=d1)
+    if promo:
+        total_ttc = calculer_prix_promo(prix_base, float(promo.pourcentage))
+    else:
+        total_ttc = round(prix_base, 2)
+
+    # ── 5. Générer un numéro de voucher unique ─────────────
     annee  = d1.year
     cnt_r  = await session.execute(_sel(_func.count(_RV.id)))
     cnt    = cnt_r.scalar_one() + 1
     numero_voucher = f"VIS-{annee}-{cnt:05d}-{_uuid.uuid4().hex[:4].upper()}"
 
-    # ── 5. Créer la réservation visiteur ───────────────────
+    # ── 6. Créer la réservation visiteur ───────────────────
     resa = _RV(
         nom              = data.nom,
         prenom           = data.prenom,
@@ -199,7 +212,7 @@ async def reserver_visiteur(
     session.add(resa)
     await session.flush()
 
-    # ── 5b. Créer la facture et la lier à la réservation ───
+    # ── 6b. Créer la facture et la lier à la réservation ───
     numero_facture = await _generate_numero_facture(session)
     facture_vis = Facture(
         numero         = numero_facture,
@@ -212,7 +225,7 @@ async def reserver_visiteur(
 
     resa.id_facture = facture_vis.id
 
-    # ── 5c. Sync contact visiteur ──────────────────────────
+    # ── 6c. Sync contact visiteur ──────────────────────────
     await upsert_contact(
         session,
         email     = data.email,
@@ -226,7 +239,7 @@ async def reserver_visiteur(
     await session.commit()
     await session.refresh(resa)
 
-    # ── 6. Charger les infos hôtel pour la réponse + email ─
+    # ── 7. Charger les infos hôtel pour la réponse + email ─
     h_res = await session.execute(_sel(_H).where(_H.id == chambre.id_hotel))
     hotel = h_res.scalar_one_or_none()
 
@@ -234,7 +247,7 @@ async def reserver_visiteur(
     hotel_nom   = hotel.nom   if hotel else "Hôtel"
     hotel_ville = hotel.ville if hotel else "—"
 
-    # ── 7. Générer le PDF voucher ───────────────────────────
+    # ── 8. Générer le PDF voucher ───────────────────────────
     pdf_bytes = _generate_voucher_pdf(
         type_resa   = "hotel",
         numero      = numero_voucher,
@@ -253,7 +266,7 @@ async def reserver_visiteur(
         methode     = data.methode,
     )
 
-    # ── 8. Envoyer le voucher PDF par email (non-bloquant) ──
+    # ── 9. Envoyer le voucher PDF par email (non-bloquant) ──
     _asyncio.create_task(
         _send_voucher_email(
             to             = data.email,
@@ -274,7 +287,7 @@ async def reserver_visiteur(
         )
     )
 
-    # ── 9. Retourner la réponse ─────────────────────────────
+    # ── 10. Retourner la réponse ─────────────────────────────
     return VisiteurReservationResponse(
         id             = resa.id,
         numero_voucher = numero_voucher,

@@ -9,6 +9,7 @@ Deux types de réservation distincts :
   2. CHAMBRES : id_voyage NULL, lignes dans ligne_reservation_chambre
                 PK = (id_reservation, id_chambre) — chambre unique par réservation
                 total = Σ (tarif_nuit × nb_nuits) par chambre
+                ► application automatique des promotions actives sur l'hôtel
 
 Flux paiement :
   EN_ATTENTE → payer()   → CONFIRMEE + facture FAC-YYYY-XXXXX créée automatiquement
@@ -167,7 +168,7 @@ async def create_reservation_voyage(
 
 
 # ═══════════════════════════════════════════════════════════
-#  CAS 2 — RÉSERVATION CHAMBRES
+#  CAS 2 — RÉSERVATION CHAMBRES (avec application auto des promos)
 # ═══════════════════════════════════════════════════════════
 async def create_reservation_chambres(
     data: ReservationChambresCreate,
@@ -177,8 +178,15 @@ async def create_reservation_chambres(
     """
     Crée une réservation pour des chambres d'hôtel.
     PK ligne = (id_reservation, id_chambre) → chambre unique par réservation.
-    total_ttc = Σ (tarif × nb_nuits) pour chaque chambre.
+    total_ttc = Σ (tarif × nb_nuits) pour chaque chambre, avec application
+    automatique de la promotion active de l'hôtel si elle existe.
     """
+    # Import local pour éviter les imports circulaires
+    from app.services.promotion_service import (
+        get_promotion_active_hotel,
+        calculer_prix_promo,
+    )
+
     nb_nuits = _nb_nuits(data.date_debut, data.date_fin)
 
     resa = Reservation(
@@ -193,6 +201,17 @@ async def create_reservation_chambres(
     await session.flush()
 
     total_ttc = 0.0
+
+    # ── Cache des promotions par hôtel (évite de requêter plusieurs fois) ──
+    promo_cache: dict = {}
+
+    async def _get_promo_for_hotel(hotel_id: int):
+        """Retourne la promo active de l'hôtel (avec cache)."""
+        if hotel_id not in promo_cache:
+            promo_cache[hotel_id] = await get_promotion_active_hotel(
+                hotel_id, session, at_date=data.date_debut
+            )
+        return promo_cache[hotel_id]
 
     for ligne in data.chambres:
         r = await session.execute(
@@ -222,8 +241,17 @@ async def create_reservation_chambres(
                 f"sur la période {data.date_debut} → {data.date_fin}"
             )
 
-        prix_unitaire  = float(tarif.prix) * nb_nuits
-        total_ttc     += prix_unitaire
+        # ── Prix de base ──────────────────────────────────
+        prix_base = float(tarif.prix) * nb_nuits
+
+        # ── Application de la promotion active si elle existe ──
+        promo = await _get_promo_for_hotel(chambre.id_hotel)
+        if promo:
+            prix_unitaire = calculer_prix_promo(prix_base, float(promo.pourcentage))
+        else:
+            prix_unitaire = round(prix_base, 2)
+
+        total_ttc += prix_unitaire
 
         session.add(LigneReservationChambre(
             id_reservation=resa.id,
@@ -234,7 +262,7 @@ async def create_reservation_chambres(
             nb_enfants=ligne.nb_enfants,
         ))
 
-    resa.total_ttc = total_ttc
+    resa.total_ttc = round(total_ttc, 2)
     await session.flush()
 
     result2 = await session.execute(
