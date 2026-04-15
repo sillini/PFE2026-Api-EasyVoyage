@@ -3,6 +3,14 @@
 Service d'envoi de catalogues emails — remplace complètement n8n.
 Les promotions actives des hôtels sont chargées et affichées
 visuellement dans l'email HTML (badge rouge + prix barré).
+
+CORRECTIONS :
+  - Bug 1 : promo.type_promotion supprimé du modèle → exception silencieuse
+            → promo_data = None → promo invisible dans email + prompt Claude
+            FIX : on utilise type_emoji = "🔥" directement (champ supprimé)
+  - Bug 2 : get_promotions_actives_multi_hotels filtre actif=True
+            → promos avec actif=False ignorées malgré APPROVED
+            FIX : utiliser get_promotions_catalogue_admin (sans filtre actif)
 """
 import asyncio
 import json
@@ -124,12 +132,17 @@ async def _load_items_with_promos(cat: Catalogue, session: AsyncSession):
       - images
       - prix minimum par chambre (tarifs actifs aujourd'hui)
       - promotion active (titre, %, prix promo calculé, date fin)
+
+    FIX : utilise get_promotions_catalogue_admin au lieu de
+          get_promotions_actives_multi_hotels pour ne pas bloquer
+          sur actif=False et éviter l'exception type_promotion.
     """
     from app.models.hotel   import Hotel, Chambre, Tarif
     from app.models.voyage  import Voyage
     from app.models.image   import Image
+    # ── FIX Bug 2 : utiliser la variante catalogue (sans filtre actif) ──
     from app.services.promotion_service import (
-        get_promotions_actives_multi_hotels,
+        get_promotions_catalogue_admin,
         calculer_prix_promo,
     )
 
@@ -152,10 +165,15 @@ async def _load_items_with_promos(cat: Catalogue, session: AsyncSession):
         )).all()
         prix_by_hotel = {r.id_hotel: float(r.pmin) for r in rows}
 
-    # ── Promotions actives (une requête) ──────────────────
+    # ── FIX Bug 2 : promotions sans filtre actif ──────────
     promos_by_hotel: dict = {}
     if hotel_ids:
-        promos_by_hotel = await get_promotions_actives_multi_hotels(hotel_ids, session)
+        promos_by_hotel = await get_promotions_catalogue_admin(hotel_ids, session)
+
+    logger.info(
+        f"[CATALOGUE {cat.id}] _load_items_with_promos — "
+        f"prix: {len(prix_by_hotel)} hôtels, promos: {len(promos_by_hotel)} trouvées"
+    )
 
     # ── Hôtels enrichis ───────────────────────────────────
     hotels = []
@@ -173,17 +191,20 @@ async def _load_items_with_promos(cat: Catalogue, session: AsyncSession):
         prix_min = prix_by_hotel.get(hid)
         promo    = promos_by_hotel.get(hid)
 
-        # Données promotion sécurisées
+        # ── FIX Bug 1 : construction promo_data sécurisée ─
+        # type_promotion a été supprimé du modèle Promotion
+        # → on n'y accède plus, on utilise "🔥" directement
         promo_data = None
         if promo is not None and prix_min:
             try:
-                pct         = float(promo.pourcentage)
-                prix_promo  = calculer_prix_promo(prix_min, pct)
-                raw_type    = promo.type_promotion
-                type_val    = raw_type.value if hasattr(raw_type, "value") else str(raw_type)
-                type_emoji  = {"STANDARD": "🎁", "EARLY_BOOKING": "⏰", "LAST_MINUTE": "⚡"}.get(type_val, "🔥")
+                pct          = float(promo.pourcentage)
+                prix_promo   = calculer_prix_promo(prix_min, pct)
                 date_fin_str = promo.date_fin.strftime("%d/%m/%Y") if promo.date_fin else None
-                promo_data  = {
+
+                # ── FIX : plus d'accès à promo.type_promotion ──
+                type_emoji   = "🔥"
+
+                promo_data = {
                     "titre":      promo.titre or "Offre spéciale",
                     "pct":        pct,
                     "prix_avant": prix_min,
@@ -191,8 +212,12 @@ async def _load_items_with_promos(cat: Catalogue, session: AsyncSession):
                     "type_emoji": type_emoji,
                     "date_fin":   date_fin_str,
                 }
+                logger.info(
+                    f"[CATALOGUE {cat.id}] Hôtel {hid} ({h.nom}) — "
+                    f"promo OK: -{pct}% → {prix_promo} DT/nuit"
+                )
             except Exception as e:
-                logger.warning(f"[CATALOGUE] Promo hôtel {hid} ignorée: {e}")
+                logger.warning(f"[CATALOGUE {cat.id}] Promo hôtel {hid} ignorée: {e}")
 
         hotels.append({
             "nom":         h.nom,
@@ -282,13 +307,12 @@ def _build_html_email(titre, sujet, description, hotels, voyages):
             p = h["promo"]
             promo_overlay = f"""
             <tr><td style="padding:0;">
-              <div style="background:#E8392A;color:#fff;padding:8px 16px;
-                          font-size:13px;font-weight:800;text-align:center;
-                          letter-spacing:0.3px;">
-                {p['type_emoji']} OFFRE LIMITÉE &nbsp;·&nbsp;
-                <span style="font-size:18px;font-weight:900;">-{int(p['pct'])}%</span>
+              <div style="background:linear-gradient(135deg,#E8392A,#C0392B);color:#fff;
+                          padding:10px 20px;text-align:center;letter-spacing:0.3px;">
+                {p['type_emoji']} &nbsp;
+                <strong style="font-size:16px;font-weight:900;">OFFRE SPÉCIALE -{int(p['pct'])}%</strong>
                 &nbsp;·&nbsp; {p['titre']}
-                {f"&nbsp;·&nbsp; jusqu'au {p['date_fin']}" if p.get('date_fin') else ""}
+                {f"&nbsp;·&nbsp; <span style='opacity:.85'>jusqu'au {p['date_fin']}</span>" if p.get('date_fin') else ""}
               </div>
             </td></tr>"""
 
@@ -297,17 +321,17 @@ def _build_html_email(titre, sujet, description, hotels, voyages):
         if h.get("promo") and h.get("prix_min"):
             p = h["promo"]
             prix_html = f"""
-              <div style="display:flex;align-items:center;gap:10px;margin:10px 0 16px;">
+              <div style="display:flex;align-items:center;gap:10px;margin:10px 0 16px;flex-wrap:wrap;">
                 <span style="font-size:13px;color:#94A3B8;text-decoration:line-through;
-                             text-decoration-color:#E8392A;">
+                             text-decoration-color:#E8392A;font-weight:600;">
                   {int(p['prix_avant'])} DT/nuit
                 </span>
-                <span style="font-size:22px;font-weight:900;color:#E8392A;">
+                <span style="font-size:24px;font-weight:900;color:#E8392A;line-height:1;">
                   {int(p['prix_apres'])} DT/nuit
                 </span>
                 <span style="background:#FEE2E2;color:#991B1B;font-size:11px;font-weight:800;
-                             padding:3px 8px;border-radius:20px;">
-                  -{int(p['pct'])}% de réduction
+                             padding:4px 10px;border-radius:20px;white-space:nowrap;">
+                  -{int(p['pct'])}% économisé
                 </span>
               </div>"""
         elif h.get("prix_min"):
@@ -320,35 +344,42 @@ def _build_html_email(titre, sujet, description, hotels, voyages):
 
         desc_html = ""
         if h.get("description"):
-            desc_html = f'<p style="font-size:13px;color:#4A5568;line-height:1.6;margin:0 0 14px;">{h["description"]}</p>'
+            desc_html = f"""
+              <p style="font-size:13px;color:#64748B;line-height:1.6;margin:0 0 14px;">
+                {h['description']}
+              </p>"""
 
+        etoiles_html = _stars(h.get("etoiles", 0))
         note_html = ""
         if h.get("note", 0) > 0:
-            note_html = f'<span style="color:#27AE60;font-weight:700;font-size:12px;">⭐ {h["note"]:.1f}/5</span>'
+            note_html = f"""
+              <span style="background:#F0FDF4;color:#16A34A;font-size:11px;font-weight:700;
+                           padding:3px 8px;border-radius:12px;margin-left:8px;">
+                ★ {h['note']:.1f}/5
+              </span>"""
 
         return f"""
-        <tr><td style="padding:0 0 28px 0;">
+        <tr><td style="padding:0 0 24px 0;">
           <table width="100%" cellpadding="0" cellspacing="0"
-                 style="border:1px solid #E4ECF5;border-radius:12px;
-                        overflow:hidden;background:#fff;
-                        box-shadow:0 2px 12px rgba(0,0,0,.06);">
+                 style="border:1px solid #E4ECF5;border-radius:14px;overflow:hidden;background:#fff;
+                        box-shadow:0 2px 16px rgba(0,0,0,.07);">
             {img_tag}
             {promo_overlay}
-            <tr><td style="padding:20px 24px;">
-              <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px;">
-                <div style="font-size:20px;font-weight:800;color:#0F2235;">{h['nom']}</div>
+            <tr><td style="padding:20px 24px 24px;">
+              <div style="font-size:21px;font-weight:800;color:#0F2235;margin-bottom:4px;">
+                {h['nom']}
+              </div>
+              <div style="font-size:13px;color:#8A9BB0;margin-bottom:8px;">
+                <span style="color:#F59E0B;">{etoiles_html}</span>
+                &nbsp;·&nbsp; 📍 {h['ville']}
                 {note_html}
               </div>
-              <div style="font-size:12px;color:#C4973A;margin-bottom:10px;">
-                {_stars(h['etoiles'])}
-                <span style="color:#8A9BB0;margin-left:6px;">📍 {h['ville']}</span>
-              </div>
-              {prix_html}
               {desc_html}
+              {prix_html}
               <a href="https://easyvoyage.tn"
-                 style="display:inline-block;background:#C4973A;color:#fff;
-                        text-decoration:none;padding:10px 24px;border-radius:8px;
-                        font-size:13px;font-weight:700;">
+                 style="display:inline-block;background:#0F2235;color:#fff;
+                        text-decoration:none;padding:11px 28px;border-radius:8px;
+                        font-size:13px;font-weight:700;letter-spacing:0.3px;">
                 Réserver maintenant →
               </a>
             </td></tr>
@@ -359,22 +390,24 @@ def _build_html_email(titre, sujet, description, hotels, voyages):
         img_tag = ""
         if v.get("image_url"):
             img_tag = f"""
-            <tr><td style="padding:0">
+            <tr><td style="padding:0;">
               <img src="{v['image_url']}" alt="{v['titre']}"
-                   width="560" style="width:100%;max-width:560px;height:200px;object-fit:cover;display:block"/>
+                   width="560" style="width:100%;max-width:560px;height:180px;object-fit:cover;display:block"/>
             </td></tr>"""
 
         places_badge = ""
-        if 0 < v.get("places", 999) <= 5:
-            places_badge = f"""<span style="background:#FEECEC;color:#C0392B;font-size:11px;
-                font-weight:700;padding:3px 10px;border-radius:20px;margin-left:8px;">
-                🔥 {v['places']} place{'s' if v['places']>1 else ''} restante{'s' if v['places']>1 else ''}</span>"""
+        if v.get("places", 99) <= 5:
+            places_badge = f"""
+              <span style="background:#FEF3C7;color:#D97706;font-size:11px;font-weight:700;
+                           padding:3px 10px;border-radius:20px;margin-left:8px;">
+                ⚡ {v['places']} place{'s' if v['places'] > 1 else ''} restante{'s' if v['places'] > 1 else ''}
+              </span>"""
 
         return f"""
         <tr><td style="padding:0 0 24px 0;">
           <table width="100%" cellpadding="0" cellspacing="0"
-                 style="border:1px solid #E4ECF5;border-radius:12px;overflow:hidden;background:#fff;
-                        box-shadow:0 2px 12px rgba(0,0,0,.06);">
+                 style="border:1px solid #E4ECF5;border-radius:14px;overflow:hidden;background:#fff;
+                        box-shadow:0 2px 16px rgba(0,0,0,.07);">
             {img_tag}
             <tr><td style="padding:20px 24px;">
               <div style="font-size:20px;font-weight:800;color:#0F2235;margin-bottom:6px;">
@@ -462,7 +495,7 @@ def _build_html_email(titre, sujet, description, hotels, voyages):
         <h1 style="color:#fff;font-size:28px;margin:0;letter-spacing:1px;">EasyVoyage</h1>
         <p style="color:rgba(255,255,255,.55);font-size:11px;margin:6px 0 0;
                   text-transform:uppercase;letter-spacing:2px;">
-          Catalogues & Offres exclusives
+          Catalogues &amp; Offres exclusives
         </p>
       </td></tr>
 
@@ -480,21 +513,24 @@ def _build_html_email(titre, sujet, description, hotels, voyages):
 
           <!-- Salutation -->
           <tr><td style="padding:0 0 18px;">
-            <p style="font-size:15px;color:#0F2235;font-weight:700;margin:0;">
-              Bonjour {{{{PRENOM_NOM}}}} 👋
+            <p style="font-size:15px;color:#0F2235;margin:0;line-height:1.6;">
+              Bonjour <strong>{{{{PRENOM_NOM}}}}</strong>,
             </p>
           </td></tr>
 
           {desc_block}
+
           {section_hotels}
+
           {section_voyages}
 
-          <!-- CTA -->
-          <tr><td style="padding:8px 0 0;text-align:center;">
+          <!-- CTA bas de page -->
+          <tr><td style="padding:24px 0 0;text-align:center;">
             <a href="https://easyvoyage.tn"
-               style="display:inline-block;background:#C4973A;color:#fff;
-                      text-decoration:none;padding:15px 40px;border-radius:10px;
-                      font-size:15px;font-weight:800;">
+               style="display:inline-block;background:linear-gradient(135deg,#C4973A,#E8B84B);
+                      color:#fff;text-decoration:none;padding:14px 40px;border-radius:10px;
+                      font-size:15px;font-weight:800;letter-spacing:0.3px;
+                      box-shadow:0 4px 14px rgba(196,151,58,.35);">
               Voir toutes nos offres →
             </a>
           </td></tr>
@@ -503,14 +539,18 @@ def _build_html_email(titre, sujet, description, hotels, voyages):
       </td></tr>
 
       <!-- PIED DE PAGE -->
-      <tr><td style="background:#F8FAFC;padding:18px 40px;text-align:center;
-                     border-top:1px solid #EEF2F7;">
-        <p style="color:#B0BEC8;font-size:11px;margin:0 0 6px;">
-          EasyVoyage — Votre partenaire de voyage en Tunisie
-        </p>
-        <p style="color:#C8D0DA;font-size:10px;margin:0;">
+      <tr><td style="background:#F8FAFC;padding:20px 40px;text-align:center;
+                     border-top:1px solid #E8EDF5;">
+        <p style="font-size:11px;color:#94A3B8;margin:0;line-height:1.7;">
+          Vous recevez cet email car vous êtes inscrit sur EasyVoyage.<br/>
+          <a href="https://easyvoyage.tn" style="color:#C4973A;text-decoration:none;">
+            easyvoyage.tn
+          </a>
+          &nbsp;·&nbsp;
           <a href="https://easyvoyage.tn/unsubscribe?email={{{{EMAIL}}}}"
-             style="color:#B0BEC8;">Se désabonner</a>
+             style="color:#94A3B8;text-decoration:underline;">
+            Se désabonner
+          </a>
         </p>
       </td></tr>
 

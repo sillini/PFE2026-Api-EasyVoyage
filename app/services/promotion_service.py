@@ -589,3 +589,39 @@ async def get_promotion_active_hotel(
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+async def get_promotions_catalogue_admin(
+    hotel_ids: List[int],
+    session: AsyncSession,
+) -> Dict[int, "Promotion"]:
+    """
+    Variante pour les catalogues admin.
+    Retourne toutes les promos APPROVED dans les dates,
+    SANS filtrer sur actif — cohérent avec la liste UI admin.
+
+    Corrige le bug : la promo s'affiche dans la liste hôtels
+    du catalogue mais est ignorée par Claude AI car actif=False.
+    """
+    if not hotel_ids:
+        return {}
+
+    today = date.today()
+    result = await session.execute(
+        select(Promotion)
+        .where(
+            Promotion.id_hotel.in_(hotel_ids),
+            Promotion.statut     == StatutPromotion.APPROVED,
+            Promotion.date_debut <= today,
+            Promotion.date_fin   >= today,
+            # ← actif == True intentionnellement absent
+        )
+        .order_by(Promotion.id_hotel, Promotion.pourcentage.desc())
+    )
+    promos = result.scalars().all()
+
+    best: Dict[int, Promotion] = {}
+    for p in promos:
+        if p.id_hotel not in best:
+            best[p.id_hotel] = p
+    return best

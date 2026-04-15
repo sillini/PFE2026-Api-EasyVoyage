@@ -77,14 +77,7 @@ def _build_contact_query(destinataires: str, inscrit_depuis: Optional[datetime] 
 # ══════════════════════════════════════════════════════════
 #  PARTIE 1 — Générer avec Claude AI
 # ══════════════════════════════════════════════════════════
-# app/api/v1/endpoints/catalogue.py
-# ══════════════════════════════════════════════════════════
-#  PARTIE 1 — Générer avec IA  (remplacez UNIQUEMENT cette fonction)
-# ══════════════════════════════════════════════════════════
-# app/api/v1/endpoints/catalogue.py
-# ══════════════════════════════════════════════════════════
-#  PARTIE 1 — Générer avec IA  (remplacez UNIQUEMENT cette fonction)
-# ══════════════════════════════════════════════════════════
+
 @router.post("/generer", response_model=CatalogueResponse, status_code=201)
 async def generer_catalogue(
     data: CatalogueGenererRequest,
@@ -93,8 +86,9 @@ async def generer_catalogue(
 ):
     from app.models.hotel  import Hotel, Chambre, Tarif
     from app.models.voyage import Voyage
+    # ── FIX 1 : get_promotions_catalogue_admin (sans filtre actif=True) ──
     from app.services.promotion_service import (
-        get_promotions_actives_multi_hotels,
+        get_promotions_catalogue_admin,
         calculer_prix_promo,
     )
     from datetime import date
@@ -124,29 +118,16 @@ async def generer_catalogue(
         prix_by_hotel = {r.id_hotel: float(r.prix_min) for r in rows}
 
     # ══════════════════════════════════════════════════════
-    #  2. Promotions actives (une seule requête SQL)
+    #  2. FIX 1 — Promotions sans filtre actif (catalogue admin)
     # ══════════════════════════════════════════════════════
     promos_by_hotel: dict = {}
     if data.hotel_ids:
-        promos_by_hotel = await get_promotions_actives_multi_hotels(
+        promos_by_hotel = await get_promotions_catalogue_admin(
             data.hotel_ids, session
         )
 
-    # ── Helper : lire type_promotion sans planter ─────────
-    def _type_label(promo) -> str:
-        """
-        Lit le champ type_promotion de l'ORM Promotion.
-        Compatible Enum SQLAlchemy (promo.type_promotion peut être
-        un TypePromotion(Enum) ou directement une str selon le chargement).
-        """
-        raw = promo.type_promotion
-        # Si c'est un Enum Python (TypePromotion) → .value donne "STANDARD" etc.
-        val = raw.value if hasattr(raw, "value") else str(raw)
-        return {
-            "STANDARD":      "Promotion",
-            "EARLY_BOOKING": "Early Booking",
-            "LAST_MINUTE":   "Last Minute",
-        }.get(val, "Promotion")
+    print(f"[CATALOGUE] prix_by_hotel={prix_by_hotel}")
+    print(f"[CATALOGUE] promos_by_hotel keys={list(promos_by_hotel.keys())}")
 
     # ══════════════════════════════════════════════════════
     #  3. Construire les blocs texte pour Claude
@@ -158,7 +139,7 @@ async def generer_catalogue(
             continue
 
         prix_min = prix_by_hotel.get(hid)
-        promo    = promos_by_hotel.get(hid)   # objet ORM Promotion ou None
+        promo    = promos_by_hotel.get(hid)
 
         bloc = (
             f"- {h.nom} ({h.ville}, {h.etoiles}★"
@@ -174,16 +155,17 @@ async def generer_catalogue(
                 pct         = float(promo.pourcentage)
                 prix_promo  = calculer_prix_promo(prix_min, pct)
                 titre_promo = promo.titre or "Offre spéciale"
-                type_lbl    = _type_label(promo)
                 date_fin    = promo.date_fin.strftime("%d/%m/%Y") if promo.date_fin else "—"
 
+                # ── FIX 2 : plus d'accès à type_promotion (champ supprimé) ──
                 bloc += (
                     f"\n  🔥 PROMOTION ACTIVE : {titre_promo}"
-                    f"\n     Réduction : -{pct:.0f}% ({type_lbl})"
+                    f"\n     Réduction : -{pct:.0f}%"
                     f"\n     Prix promo : {prix_promo:.0f} DT/nuit"
                     f" (au lieu de {prix_min:.0f} DT)"
                     f"\n     Valable jusqu'au : {date_fin}"
                 )
+                print(f"[CATALOGUE] Hôtel {h.nom} → promo -{pct}% ajoutée au prompt")
             except Exception as e:
                 print(f"[CATALOGUE] Erreur lecture promo hôtel {hid}: {e}")
 
@@ -301,6 +283,7 @@ async def generer_catalogue(
     await session.refresh(cat)
     return cat
 
+
 # ══════════════════════════════════════════════════════════
 #  MODIFIER UN CATALOGUE
 # ══════════════════════════════════════════════════════════
@@ -333,11 +316,6 @@ async def modifier_catalogue(
 #  PREVIEW — Rendu HTML avant envoi
 # ══════════════════════════════════════════════════════════
 
-# app/api/v1/endpoints/catalogue.py
-# ══════════════════════════════════════════════════════════
-#  ENDPOINT PREVIEW — remplacez UNIQUEMENT cette fonction
-# ══════════════════════════════════════════════════════════
-
 @router.get("/{catalogue_id}/preview")
 async def preview_catalogue(
     catalogue_id: int,
@@ -348,10 +326,9 @@ async def preview_catalogue(
     Retourne le HTML final de l'email avec un contact fictif.
     Affiche les promotions actives exactement comme dans l'email réel.
     """
-    # ── Imports depuis le nouveau service ────────────────
     from app.services.catalogue_send_service import (
         _parse_description_ia,
-        _load_items_with_promos,   # ← nouveau nom (était _load_items)
+        _load_items_with_promos,
         _build_html_email,
         _personalize,
     )
@@ -371,7 +348,6 @@ async def preview_catalogue(
         voyages     = voyages,
     )
 
-    # Substituer avec un contact fictif pour la prévisualisation
     contact_demo = {
         "prenom": "Jean",
         "nom":    "Dupont",
@@ -380,6 +356,7 @@ async def preview_catalogue(
     html_preview = _personalize(html, contact_demo)
 
     return {"html": html_preview, "sujet": sujet, "titre": cat.titre}
+
 
 # ══════════════════════════════════════════════════════════
 #  COMPTER LES DESTINATAIRES (avant envoi)
@@ -411,8 +388,6 @@ async def compter_destinataires(
 # ══════════════════════════════════════════════════════════
 #  ENVOYER — Remplace complètement n8n
 # ══════════════════════════════════════════════════════════
-# app/api/v1/endpoints/catalogue.py  —  SECTION ENVOYER UNIQUEMENT
-# Remplacez uniquement la fonction envoyer_catalogue dans votre fichier existant
 
 @router.post("/{catalogue_id}/envoyer", response_model=CatalogueResponse)
 async def envoyer_catalogue(
@@ -434,8 +409,6 @@ async def envoyer_catalogue(
 
     if data.contact_ids:
         # ── MODE MANUEL : IDs explicites fournis par le frontend ──
-        # On charge EXACTEMENT ces contacts, dans l'ordre fourni.
-        # Aucun filtre par type, aucun LIMIT arbitraire.
         contacts_list = []
         for cid in data.contact_ids:
             c = await session.get(Contact, cid)
@@ -511,6 +484,7 @@ async def envoyer_catalogue(
     background_tasks.add_task(_run)
     return cat
 
+
 # ══════════════════════════════════════════════════════════
 #  LOGS D'ENVOI — Historique par catalogue
 # ══════════════════════════════════════════════════════════
@@ -549,7 +523,6 @@ async def track_open(
         log.opened_at = datetime.now(timezone.utc)
         await session.commit()
 
-    # GIF transparent 1×1
     gif = (
         b'\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00\x80\x00\x00'
         b'\xff\xff\xff\x00\x00\x00\x21\xf9\x04\x00\x00\x00\x00\x00'
@@ -589,9 +562,9 @@ async def get_catalogue_detail(
     session: AsyncSession = Depends(get_db),
     _: TokenData = Depends(require_admin),
 ):
-    from app.models.hotel import Hotel
+    from app.models.hotel  import Hotel
     from app.models.voyage import Voyage
-    from app.models.image import Image
+    from app.models.image  import Image
 
     cat = await session.get(Catalogue, catalogue_id)
     if not cat:
@@ -654,22 +627,22 @@ async def get_catalogue_detail(
     }
 
     return {
-        "id":              cat.id,
-        "titre":           cat.titre,
-        "description_ia":  cat.description_ia,
-        "destinataires":   cat.destinataires,
-        "statut":          cat.statut,
-        "nb_envoyes":      cat.nb_envoyes,
-        "nb_echecs":       cat.nb_echecs,
-        "scheduled_at":    cat.scheduled_at,
+        "id":               cat.id,
+        "titre":            cat.titre,
+        "description_ia":   cat.description_ia,
+        "destinataires":    cat.destinataires,
+        "statut":           cat.statut,
+        "nb_envoyes":       cat.nb_envoyes,
+        "nb_echecs":        cat.nb_echecs,
+        "scheduled_at":     cat.scheduled_at,
         "tracking_enabled": cat.tracking_enabled,
-        "created_at":      cat.created_at,
-        "envoye_at":       cat.envoye_at,
-        "hotel_ids":       cat.hotel_ids,
-        "voyage_ids":      cat.voyage_ids,
-        "hotels":          hotels_detail,
-        "voyages":         voyages_detail,
-        "logs_summary":    logs_summary,
+        "created_at":       cat.created_at,
+        "envoye_at":        cat.envoye_at,
+        "hotel_ids":        cat.hotel_ids,
+        "voyage_ids":       cat.voyage_ids,
+        "hotels":           hotels_detail,
+        "voyages":          voyages_detail,
+        "logs_summary":     logs_summary,
     }
 
 
