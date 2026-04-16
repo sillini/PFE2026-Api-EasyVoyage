@@ -1,6 +1,9 @@
 """
-FastAPI application entry point.
+app/main.py
+===========
+FastAPI application entry point — EasyVoyage.
 """
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -20,7 +23,7 @@ def create_app() -> FastAPI:
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_url="/openapi.json",
-        lifespan=lifespan_scheduler,   # ← scheduler branché ici
+        lifespan=lifespan_scheduler,
     )
 
     # ── CORS ──────────────────────────────────────────────────
@@ -39,13 +42,17 @@ def create_app() -> FastAPI:
         expose_headers=["Content-Disposition"],
     )
 
-    # ── Routers ───────────────────────────────────────────────
+    # ── Routers API v1 ────────────────────────────────────────
     app.include_router(api_v1_router)
 
     # ── Health check ──────────────────────────────────────────
     @app.get("/health", tags=["System"], summary="Health check")
     async def health() -> dict:
-        return {"status": "ok", "app": settings.APP_NAME, "env": settings.APP_ENV}
+        return {
+            "status": "ok",
+            "app":    settings.APP_NAME,
+            "env":    settings.APP_ENV,
+        }
 
     return app
 
