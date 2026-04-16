@@ -209,3 +209,41 @@ async def envoyer_campaign(
             f"{traceback.format_exc()}"
         )
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+# ══════════════════════════════════════════════════════════
+#  RENVOYER (renvoi d'une campagne déjà envoyée)
+# ══════════════════════════════════════════════════════════
+@router.post("/{campaign_id}/renvoyer",
+             response_model=VideoCampaignResponse,
+             summary="Renvoyer une campagne vidéo [ADMIN]")
+async def renvoyer_campaign(
+    campaign_id: int,
+    data: EnvoyerVideoCampaignRequest,
+    session: AsyncSession = Depends(get_db),
+    _: TokenData = Depends(require_admin),
+) -> VideoCampaignResponse:
+    try:
+        return await svc.renvoyer_campaign(campaign_id, data, session)
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"[VIDEO_CAMPAIGN] ERREUR renvoyer #{campaign_id}:\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+# ══════════════════════════════════════════════════════════
+#  DESTINATAIRES — liste emails
+# ══════════════════════════════════════════════════════════
+@router.get("/{campaign_id}/destinataires",
+            summary="Liste des destinataires [ADMIN]")
+async def get_destinataires(
+    campaign_id: int,
+    search: str = Query("", description="Recherche par email, prénom ou nom"),
+    session: AsyncSession = Depends(get_db),
+    _: TokenData = Depends(require_admin),
+) -> dict:
+    contacts = await svc.get_destinataires(campaign_id, session, search=search)
+    return {"total": len(contacts), "items": contacts}

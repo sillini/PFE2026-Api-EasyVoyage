@@ -227,18 +227,48 @@ async def envoyer_campaign(
     campaign_id: int,
     data: EnvoyerVideoCampaignRequest,
     session: AsyncSession,
+    is_renvoi: bool = False,
+    _camp_obj=None,           # objet déjà chargé (évite un rechargement BDD)
 ) -> VideoCampaignResponse:
     """
-    Envoie la campagne vidéo par email à tous les contacts du segment.
+    Envoie la campagne vidéo par email.
+    - 1er envoi    : stocke les destinataires dans contact_ids
+    - Renvoi       : CUMULE les anciens + nouveaux, déduplique par email
+    - Pas de doublon même si on renvoie plusieurs fois au même contact
     """
-    camp = await _get_or_404(campaign_id, session)
+    # Si l'objet est passé directement (cas renvoi), l'utiliser sans rechargement
+    camp = _camp_obj if _camp_obj is not None else await _get_or_404(campaign_id, session)
 
     if camp.statut != StatutVideoCampaign.PRET:
         raise ValueError(
-            f"La campagne doit être à l'état PRET pour être envoyée (actuel: {camp.statut.value})"
+            f"La campagne doit être à l'état PRET (actuel: {camp.statut.value})"
         )
 
-    # Résoudre les contacts
+    # ── LIRE les anciens destinataires AVANT tout commit ──
+    # On lit ici pendant que la session est fraîche.
+    # C'est le seul endroit fiable pour lire contact_ids.
+    anciens: list[dict] = []
+    if camp.contact_ids and isinstance(camp.contact_ids, list):
+        for item in camp.contact_ids:
+            if isinstance(item, dict) and "email" in item:
+                anciens.append(item)
+            elif isinstance(item, int):
+                # Format legacy : ID entier → charger le contact
+                c = await session.get(Contact, item)
+                if c:
+                    anciens.append({
+                        "email":  c.email,
+                        "prenom": c.prenom or "",
+                        "nom":    c.nom or "",
+                        "type":   c.type or "tous",
+                    })
+
+    logger.info(
+        f"[VIDEO_CAMPAIGN] envoyer #{campaign_id} | "
+        f"is_renvoi={is_renvoi} | anciens={len(anciens)}"
+    )
+
+    # Résoudre les contacts à envoyer
     contacts = await _resoudre_contacts(data, session)
     if not contacts:
         raise ValueError("Aucun contact trouvé pour ce segment")
@@ -252,34 +282,156 @@ async def envoyer_campaign(
 
     envoyes = 0
     echecs  = 0
+    contacts_ok: list[dict] = []
 
     for i in range(0, len(contacts), BATCH_SIZE):
         batch = contacts[i:i + BATCH_SIZE]
-        tasks = [
-            _envoyer_a_contact(camp, contact, sujet)
-            for contact in batch
-        ]
+        tasks = [_envoyer_a_contact(camp, contact, sujet) for contact in batch]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for r in results:
+        for j, r in enumerate(results):
             if isinstance(r, Exception):
                 echecs += 1
                 logger.warning(f"[VIDEO_CAMPAIGN] Échec envoi : {r}")
             else:
                 envoyes += 1
+                contacts_ok.append(batch[j])
 
         if i + BATCH_SIZE < len(contacts):
             await asyncio.sleep(BATCH_DELAY)
 
-    camp.nb_envoyes = envoyes
-    camp.nb_echecs  = echecs
-    camp.statut     = StatutVideoCampaign.ENVOYE if envoyes > 0 else StatutVideoCampaign.ECHOUE
-    camp.envoye_at  = datetime.now(timezone.utc)
+    # ── Fusionner anciens + nouveaux SANS doublons ─────────
+    # Toujours partir des anciens (même au 1er envoi ils sont vides = [])
+    # puis ajouter les nouveaux envois réussis s'ils ne sont pas déjà là
+    seen_emails: set[str] = {c["email"] for c in anciens}
+    for c in contacts_ok:
+        if c["email"] not in seen_emails:
+            anciens.append(c)
+            seen_emails.add(c["email"])
+
+    total_unique = len(anciens)
+
+    # Mettre à jour en BDD
+    camp.contact_ids = anciens          # historique complet cumulé sans doublons
+    camp.nb_envoyes  = total_unique     # total contacts uniques ayant reçu la campagne
+    camp.nb_echecs   = echecs
+    camp.statut      = StatutVideoCampaign.ENVOYE if envoyes > 0 else StatutVideoCampaign.ECHOUE
+    camp.envoye_at   = datetime.now(timezone.utc)
     await session.commit()
     await session.refresh(camp)
 
-    logger.info(f"[VIDEO_CAMPAIGN] Envoi terminé — id={campaign_id} : {envoyes} OK / {echecs} KO")
+    logger.info(
+        f"[VIDEO_CAMPAIGN] Envoi terminé #{campaign_id} : "
+        f"+{envoyes} nouveaux | total unique={total_unique} | KO={echecs}"
+    )
     return VideoCampaignResponse.model_validate(camp)
+
+
+# ══════════════════════════════════════════════════════════
+#  RENVOYER (remet PRET + renvoie)
+# ══════════════════════════════════════════════════════════
+
+async def renvoyer_campaign(
+    campaign_id: int,
+    data: "EnvoyerVideoCampaignRequest",
+    session: AsyncSession,
+) -> "VideoCampaignResponse":
+    """
+    Renvoi d'une campagne déjà envoyée.
+
+    IMPORTANT : on lit contact_ids AVANT de changer le statut,
+    puis on appelle envoyer_campaign qui les lira à nouveau.
+    Pour éviter le problème de rechargement JSON après commit,
+    on remet le statut à PRET sans flush intermédiaire.
+    """
+    camp = await _get_or_404(campaign_id, session)
+
+    # Vérifier qu'il y a une vidéo
+    if not camp.video_url_landscape and not camp.video_url_portrait and not camp.video_url_square:
+        raise ValueError("Aucune vidéo générée — impossible de renvoyer")
+
+    # Remettre à PRET SANS commit (juste modifier l'objet en mémoire)
+    # envoyer_campaign lira contact_ids depuis le même objet en session
+    camp.statut = StatutVideoCampaign.PRET
+    camp.erreur = None
+    # Pas de commit ici — envoyer_campaign va commitera
+
+    logger.info(f"[VIDEO_CAMPAIGN] Renvoi campagne #{campaign_id} — remise à PRET (sans commit)")
+    # Passer l'objet camp directement pour conserver contact_ids en mémoire
+    return await envoyer_campaign(campaign_id, data, session, is_renvoi=True, _camp_obj=camp)
+
+
+# ══════════════════════════════════════════════════════════
+#  DESTINATAIRES — récupérer la liste avec emails
+# ══════════════════════════════════════════════════════════
+
+async def get_destinataires(
+    campaign_id: int,
+    session: AsyncSession,
+    search: str = "",
+) -> list[dict]:
+    """
+    Retourne la liste complète des destinataires (tous envois cumulés, sans doublons).
+    contact_ids stocke maintenant des dicts {email, prenom, nom, type}.
+    """
+    camp = await _get_or_404(campaign_id, session)
+
+    contacts: list[dict] = []
+
+    # contact_ids contient maintenant les dicts complets (depuis la correction)
+    if camp.contact_ids:
+        raw = camp.contact_ids
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict) and "email" in item:
+                    # Format nouveau : dict {email, prenom, nom, type}
+                    contacts.append({
+                        "id":     item.get("id", ""),
+                        "email":  item.get("email", ""),
+                        "prenom": item.get("prenom", ""),
+                        "nom":    item.get("nom", ""),
+                        "type":   item.get("type", "tous"),
+                    })
+                elif isinstance(item, int):
+                    # Format ancien : IDs entiers → charger depuis Contact
+                    c = await session.get(Contact, item)
+                    if c:
+                        contacts.append({
+                            "id":     c.id,
+                            "email":  c.email,
+                            "prenom": c.prenom or "",
+                            "nom":    c.nom or "",
+                            "type":   c.type or "tous",
+                        })
+
+    # Si aucun contact stocké → approximation par segment
+    if not contacts and camp.nb_envoyes:
+        q = select(Contact).order_by(Contact.created_at.desc())
+        if camp.segment in ("client", "visiteur"):
+            q = q.where(Contact.type == camp.segment)
+        q = q.limit(camp.nb_envoyes or 50)
+        rows = (await session.execute(q)).scalars().all()
+        contacts = [
+            {
+                "id":     c.id,
+                "email":  c.email,
+                "prenom": c.prenom or "",
+                "nom":    c.nom or "",
+                "type":   c.type or "tous",
+            }
+            for c in rows
+        ]
+
+    # Filtre recherche
+    if search:
+        q_low = search.lower()
+        contacts = [
+            c for c in contacts
+            if q_low in c["email"].lower()
+            or q_low in (c["prenom"] + " " + c["nom"]).lower()
+        ]
+
+    return contacts
 
 
 # ══════════════════════════════════════════════════════════
@@ -433,28 +585,76 @@ def _build_email_html(camp: VideoCampaign, contact: dict) -> str:
     # Lien vers la plateforme
     lien_reservation = "http://localhost:3000"
 
-    # Section vidéo : GIF animé si disponible, sinon thumbnail statique
+    # Section vidéo — compatible Gmail :
+    # Gmail bloque <video> → on utilise une image thumbnail cliquable
+    # avec un bouton ▶ superposé qui ouvre la vidéo dans le navigateur.
+    # C'est la technique standard utilisée par tous les emaileurs pro
+    # (Mailchimp, SendGrid, Brevo...).
     if video_url:
-        video_section = f"""
+        # Thumbnail Cloudinary avec transformation : frame à 1s + overlay play
+        # Si URL Cloudinary → générer une miniature automatique
+        if "res.cloudinary.com" in video_url:
+            # Cloudinary génère automatiquement une miniature .jpg
+            # en remplaçant /video/upload/ par /video/upload/so_1/
+            thumb_url = video_url.replace(
+                "/video/upload/", "/video/upload/so_1,w_600,c_scale/"
+            ).replace(".mp4", ".jpg")
+        elif thumbnail:
+            thumb_url = thumbnail
+        else:
+            thumb_url = ""
+
+        if thumb_url:
+            # Image cliquable avec bouton play superposé (100% compatible Gmail)
+            video_section = f"""
         <div style="text-align:center;margin:20px 0;">
-          <a href="{lien_reservation}" style="display:block;">
-            <video width="100%" style="max-width:600px;border-radius:12px;"
-                   autoplay muted loop playsinline poster="{thumbnail}">
-              <source src="{video_url}" type="video/mp4">
-              <!-- Fallback image si vidéo non supportée -->
-              <img src="{thumbnail}" alt="{destination}" style="width:100%;border-radius:12px;">
-            </video>
+          <!--[if !mso]><!-->
+          <a href="{video_url}" target="_blank"
+             style="display:inline-block;position:relative;max-width:560px;width:100%;">
+            <img src="{thumb_url}"
+                 alt="▶ Cliquez pour voir la vidéo — {destination}"
+                 width="560"
+                 style="width:100%;max-width:560px;border-radius:12px;
+                        display:block;border:0;outline:none;" />
+            <!-- Overlay play button -->
+            <span style="position:absolute;top:50%;left:50%;
+                         transform:translate(-50%,-50%);
+                         width:64px;height:64px;border-radius:50%;
+                         background:rgba(196,151,58,0.92);
+                         display:flex;align-items:center;justify-content:center;
+                         font-size:24px;color:white;
+                         box-shadow:0 4px 20px rgba(0,0,0,0.4);">
+              ▶
+            </span>
           </a>
-          <p style="font-size:12px;color:#8A9BB0;margin-top:8px;">
-            ▶ Vidéo non visible ? <a href="{video_url}" style="color:#C4973A;">Cliquez ici</a>
+          <!--<![endif]-->
+          <p style="font-size:12px;color:#8A9BB0;margin:10px 0 0;">
+            ▶ Voir la vidéo :
+            <a href="{video_url}" target="_blank"
+               style="color:#C4973A;font-weight:600;">Cliquez ici</a>
+          </p>
+        </div>"""
+        else:
+            video_section = f"""
+        <div style="text-align:center;margin:20px 0;">
+          <a href="{video_url}" target="_blank"
+             style="display:inline-block;background:#0F2235;color:#C4973A;
+                    text-decoration:none;padding:16px 40px;border-radius:10px;
+                    font-size:16px;font-weight:700;">
+            ▶ Voir la vidéo
+          </a>
+          <p style="font-size:12px;color:#8A9BB0;margin:8px 0 0;">
+            Lien : <a href="{video_url}" style="color:#C4973A;">{video_url[:60]}...</a>
           </p>
         </div>"""
     elif thumbnail:
         video_section = f"""
         <div style="text-align:center;margin:20px 0;">
-          <a href="{lien_reservation}">
+          <a href="{lien_reservation}" target="_blank">
             <img src="{thumbnail}" alt="{destination}"
-                 style="width:100%;max-width:600px;border-radius:12px;">
+                 width="560"
+                 style="width:100%;max-width:560px;border-radius:12px;
+                        display:block;border:0;" />
           </a>
         </div>"""
     else:
