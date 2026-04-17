@@ -4,13 +4,14 @@ run_mcp_finances.py
 Serveur MCP 2 — Finances & Partenaires & Promotions
 Port : 8766
 
-Tools inclus (7) :
+Tools inclus :
   - admin_partenaires_liste
   - admin_partenaire_detail
   - admin_partenaires_demandes
   - admin_promotions_liste
   - admin_finances_dashboard
   - admin_finances_commissions
+  - admin_finances_soldes        ← NOUVEAU
   - admin_factures_liste
 """
 import sys, os
@@ -23,7 +24,11 @@ from easyvoyage_mcp.tools.admin_partenaires import (
     admin_partenaires_liste, admin_partenaire_detail, admin_partenaires_demandes
 )
 from easyvoyage_mcp.tools.admin_promotions  import admin_promotions_liste
-from easyvoyage_mcp.tools.admin_finances    import admin_finances_dashboard, admin_finances_commissions
+from easyvoyage_mcp.tools.admin_finances    import (
+    admin_finances_dashboard,
+    admin_finances_commissions,
+    admin_finances_soldes,
+)
 from easyvoyage_mcp.tools.admin_factures    import admin_factures_liste
 
 mcp = FastMCP("easyvoyage-finances-partenaires-promotions")
@@ -34,6 +39,7 @@ mcp.tool()(admin_partenaires_demandes)
 mcp.tool()(admin_promotions_liste)
 mcp.tool()(admin_finances_dashboard)
 mcp.tool()(admin_finances_commissions)
+mcp.tool()(admin_finances_soldes)
 mcp.tool()(admin_factures_liste)
 
 if __name__ == "__main__":
