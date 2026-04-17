@@ -28,8 +28,9 @@ from app.api.v1.endpoints.demandes_partenaire import (
 )
 from app.api.v1.endpoints import hotel_ai_analysis
 from app.api.v1.endpoints import promotions
-from app.api.v1.endpoints import fiscal                    # ← NOUVEAU
+from app.api.v1.endpoints import fiscal
 from app.api.v1.endpoints import video_campaign
+from app.api.v1.endpoints import agent_ia                  # ← NOUVEAU
 
 api_v1_router = APIRouter(prefix="/api/v1")
 
@@ -62,5 +63,6 @@ api_v1_router.include_router(publication_facebook.router)
 api_v1_router.include_router(catalogue.router)
 api_v1_router.include_router(hotel_ai_analysis.router)
 api_v1_router.include_router(promotions.router)
-api_v1_router.include_router(fiscal.router)                # ← NOUVEAU
+api_v1_router.include_router(fiscal.router)
 api_v1_router.include_router(video_campaign.router)
+api_v1_router.include_router(agent_ia.router)              # ← NOUVEAU
