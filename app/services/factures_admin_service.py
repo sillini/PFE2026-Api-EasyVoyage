@@ -12,6 +12,9 @@ Fonctions principales :
 Architecture :
   Les trois types de factures sont récupérés séparément puis fusionnés/triés.
   Le filtre `type` permet de n'afficher qu'une seule catégorie (utile pour les onglets).
+
+✅ CORRECTION : Ajout de `selectinload(Chambre.type_chambre)` dans `_detail_client`
+   pour corriger l'erreur `MissingGreenlet: greenlet_spawn has not been called`.
 """
 from datetime import datetime, date
 from typing import Optional, Literal, List
@@ -452,8 +455,13 @@ async def _detail_client(facture_id: int, session: AsyncSession) -> FactureAdmin
         for ligne in resa.lignes_chambres:
             nb_nuits = (resa.date_fin - resa.date_debut).days
             hotel_nom = await _get_hotel_nom(ligne.id_chambre, session)
+
+            # ✅ FIX : précharger type_chambre avec selectinload pour éviter
+            #         l'erreur MissingGreenlet lors de l'accès à chambre.type_chambre
             r_ch = await session.execute(
-                select(Chambre).where(Chambre.id == ligne.id_chambre)
+                select(Chambre)
+                .options(selectinload(Chambre.type_chambre))
+                .where(Chambre.id == ligne.id_chambre)
             )
             chambre = r_ch.scalar_one_or_none()
             ch_nom = chambre.type_chambre.nom if chambre and chambre.type_chambre else f"Chambre #{ligne.id_chambre}"
