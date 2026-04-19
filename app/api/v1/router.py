@@ -31,6 +31,7 @@ from app.api.v1.endpoints import promotions
 from app.api.v1.endpoints import fiscal
 from app.api.v1.endpoints import video_campaign
 from app.api.v1.endpoints import agent_ia                  # ← NOUVEAU
+from app.api.v1.endpoints import agent_ia_client           # ← NOUVEAU
 
 api_v1_router = APIRouter(prefix="/api/v1")
 
@@ -66,3 +67,4 @@ api_v1_router.include_router(promotions.router)
 api_v1_router.include_router(fiscal.router)
 api_v1_router.include_router(video_campaign.router)
 api_v1_router.include_router(agent_ia.router)              # ← NOUVEAU
+api_v1_router.include_router(agent_ia_client.router)  
