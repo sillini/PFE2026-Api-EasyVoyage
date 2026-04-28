@@ -32,6 +32,11 @@ from app.api.v1.endpoints import fiscal
 from app.api.v1.endpoints import video_campaign
 from app.api.v1.endpoints import agent_ia                  # ← NOUVEAU
 from app.api.v1.endpoints import agent_ia_client           # ← NOUVEAU
+from app.api.v1.endpoints import agent_ia_partenaire 
+from app.api.v1.endpoints import hotel_description_ai          # ← NOUVEAU
+from app.api.v1.endpoints import chambre_description_ai 
+from app.api.v1.endpoints import promotion_description_ai  
+from app.api.v1.endpoints import hotel_ai_analysis_partenaire  
 
 api_v1_router = APIRouter(prefix="/api/v1")
 
@@ -68,3 +73,9 @@ api_v1_router.include_router(fiscal.router)
 api_v1_router.include_router(video_campaign.router)
 api_v1_router.include_router(agent_ia.router)              # ← NOUVEAU
 api_v1_router.include_router(agent_ia_client.router)  
+api_v1_router.include_router(agent_ia_partenaire.router)
+
+api_v1_router.include_router(hotel_description_ai.router)      # ← NOUVEAU
+api_v1_router.include_router(chambre_description_ai.router)
+api_v1_router.include_router(promotion_description_ai.router) 
+api_v1_router.include_router(hotel_ai_analysis_partenaire.router)

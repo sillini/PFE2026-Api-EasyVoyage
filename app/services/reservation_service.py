@@ -16,6 +16,9 @@ Flux paiement :
                             + calcul fiscal dynamique (taxe séjour, TVA, timbre)
   CONFIRMEE  → annuler() → ANNULEE   (facture → ANNULEE)
   CONFIRMEE  → PostgreSQL scheduler  → TERMINEE (quand date_fin < aujourd'hui)
+
+✅ AJOUT : notification automatique de TOUS les admins
+   à chaque nouvelle réservation (voyage ou chambre).
 """
 from datetime import date, datetime, timezone
 from typing import Optional
@@ -40,7 +43,9 @@ from app.schemas.reservation import (
     ReservationResponse,
     ReservationVoyageCreate,
 )
-
+# ✅ Helper de notification centralisé
+from app.services.notification_helper import notify_all_admins, NotifType
+from app.models.utilisateur import Utilisateur
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _nb_nuits(date_debut: date, date_fin: date) -> int:
@@ -156,6 +161,22 @@ async def create_reservation_voyage(
     session.add(resa)
     await session.flush()
 
+    # 🔔 Notifier tous les admins
+    try:
+        client = (await session.execute(
+            select(Utilisateur).where(Utilisateur.id == client_id)
+        )).scalar_one_or_none()
+        client_nom = f"{client.prenom} {client.nom}" if client else "Un client"
+
+        await notify_all_admins(
+            session,
+            type_   = NotifType.NOUVELLE_RESERVATION,
+            titre   = "Nouvelle réservation voyage",
+            message = f"{client_nom} a réservé « {voyage.titre} » ({total_ttc:.2f} DT)",
+        )
+    except Exception:
+        pass  # ne jamais bloquer la création
+
     result2 = await session.execute(
         select(Reservation)
         .options(
@@ -257,6 +278,23 @@ async def create_reservation_chambres(
 
     resa.total_ttc = round(total_ttc, 2)
     await session.flush()
+
+    # 🔔 Notifier tous les admins
+    try:
+        client = (await session.execute(
+            select(Utilisateur).where(Utilisateur.id == client_id)
+        )).scalar_one_or_none()
+        client_nom = f"{client.prenom} {client.nom}" if client else "Un client"
+        nb_chambres = len(data.chambres)
+
+        await notify_all_admins(
+            session,
+            type_   = NotifType.NOUVELLE_RESERVATION,
+            titre   = "Nouvelle réservation hôtel",
+            message = f"{client_nom} a réservé {nb_chambres} chambre{'s' if nb_chambres > 1 else ''} ({total_ttc:.2f} DT)",
+        )
+    except Exception:
+        pass  # ne jamais bloquer la création
 
     result2 = await session.execute(
         select(Reservation)

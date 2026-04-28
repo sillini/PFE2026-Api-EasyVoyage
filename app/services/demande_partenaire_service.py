@@ -1,5 +1,8 @@
 """
 Service métier — Demandes d'inscription partenaire.
+
+✅ AJOUT : notification automatique de TOUS les admins
+   à chaque nouvelle demande soumise depuis la landing page.
 """
 import secrets
 import string
@@ -19,6 +22,9 @@ from app.schemas.demande_partenaire import (
     TraiterDemandeResponse,
 )
 from app.core.exceptions import NotFoundException, BadRequestException
+
+# ✅ Helper de notification centralisé
+from app.services.notification_helper import notify_all_admins, NotifType
 
 
 # ═══════════════════════════════════════════════════════════
@@ -60,6 +66,19 @@ async def soumettre_demande(
     )
     session.add(demande)
     await session.flush()
+    await session.refresh(demande)
+
+    # 🔔 Notifier tous les admins
+    await notify_all_admins(
+        session,
+        type_   = NotifType.NOUVELLE_DEMANDE_PARTENAIRE,
+        titre   = "Nouvelle demande partenaire",
+        message = f"{data.prenom} {data.nom} ({data.nom_entreprise}) souhaite rejoindre EasyVoyage",
+    )
+
+    # ✅ Commit explicite pour persister la demande ET les notifs ensemble
+    #    (cet endpoint est public, pas de commit auto ailleurs dans le pipeline)
+    await session.commit()
     await session.refresh(demande)
 
     return DemandePartenairePublicResponse(

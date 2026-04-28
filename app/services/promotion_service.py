@@ -29,7 +29,8 @@ from app.schemas.promotion import (
     PromotionUpdate,
     UserMini,
 )
-
+# ✅ Helper de notification centralisé
+from app.services.notification_helper import notify_all_admins, NotifType
 
 # ═══════════════════════════════════════════════════════════
 #  HELPERS
@@ -275,7 +276,6 @@ async def get_promotion(
         raise ForbiddenException("Accès refusé")
     return _to_response(promo)
 
-
 async def create_promotion(
     hotel_id: int,
     data: PromotionCreate,
@@ -308,9 +308,22 @@ async def create_promotion(
         .where(Promotion.id == promo.id)
     )
     promo = result.scalar_one()
+
+    # 🔔 Notifier tous les admins (à valider)
+    hotel_nom      = promo.hotel.nom if promo.hotel else "?"
+    partenaire_nom = (
+        f"{promo.partenaire.prenom} {promo.partenaire.nom}"
+        if promo.partenaire else "Un partenaire"
+    )
+    await notify_all_admins(
+        session,
+        type_   = NotifType.NOUVELLE_PROMOTION,
+        titre   = "Nouvelle promotion à valider",
+        message = f"{partenaire_nom} a soumis « {promo.titre} » (-{int(promo.pourcentage)}%) pour {hotel_nom}",
+    )
+
     await session.commit()
     return _to_response(promo)
-
 
 async def update_promotion(
     promo_id: int,

@@ -44,7 +44,8 @@ from app.schemas.finances_partenaire import (
     PartDemandeItem,
     PartDemandesResponse,
 )
-
+# ✅ Helper de notification centralisé
+from app.services.notification_helper import notify_all_admins, NotifType
 _TAUX_COMMISSION = 10.0
 _PART_PARTENAIRE = 1.0 - (_TAUX_COMMISSION / 100.0)   # 0.90
 
@@ -628,12 +629,32 @@ async def demander_retrait(
         )
 
     # ✅ INSERT dans withdraw_requests uniquement — pas dans paiement_partenaire
+    # ✅ INSERT dans withdraw_requests uniquement — pas dans paiement_partenaire
     session.add(WithdrawRequest(
         id_partenaire=id_partenaire,
         montant=req.montant,
         note=req.note or None,
         statut="EN_ATTENTE",
     ))
+    await session.flush()
+
+    # 🔔 Récupérer les infos partenaire pour la notif
+    part_user = (await session.execute(
+        select(Utilisateur).where(Utilisateur.id == id_partenaire)
+    )).scalar_one_or_none()
+    part_nom = (
+        f"{part_user.prenom} {part_user.nom}"
+        if part_user else f"Partenaire #{id_partenaire}"
+    )
+
+    # 🔔 Notifier tous les admins
+    await notify_all_admins(
+        session,
+        type_   = NotifType.NOUVELLE_DEMANDE_RETRAIT,
+        titre   = "Nouvelle demande de retrait",
+        message = f"{part_nom} demande un retrait de {req.montant:.2f} DT",
+    )
+
     await session.commit()
 
     return PartDemandeRetraitResponse(
@@ -642,7 +663,6 @@ async def demander_retrait(
         montant_demande=req.montant,
         solde_disponible=round(solde_dispo - req.montant, 2),
     )
-
 
 # ═══════════════════════════════════════════════════════════
 #  MES DEMANDES DE RETRAIT (historique partenaire)
