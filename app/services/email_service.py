@@ -173,6 +173,154 @@ async def send_welcome_partenaire_email(
 
 
 # ══════════════════════════════════════════════════════════
+#  ✨ NEW : OTP INVITATION ADMIN
+# ══════════════════════════════════════════════════════════
+
+async def send_admin_otp_email(to: str, code: str, invitant_nom: str) -> None:
+    """Email contenant le code OTP d'invitation pour un nouvel administrateur."""
+    html = f"""
+<!DOCTYPE html>
+<html><body style="font-family:Arial,sans-serif;background:#f4f6f8;margin:0;padding:0;">
+<table width="100%" cellpadding="0" cellspacing="0">
+  <tr><td align="center" style="padding:40px 20px;">
+    <table width="560" style="background:white;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+      <tr><td style="background:linear-gradient(135deg,#0F2235,#1A3F63);padding:32px;text-align:center;">
+        <h1 style="color:white;font-size:24px;margin:0;font-family:'Georgia',serif;">EasyVoyage</h1>
+        <p style="color:#C4973A;margin:8px 0 0;font-size:13px;letter-spacing:2px;text-transform:uppercase;">
+          Espace Administrateur
+        </p>
+      </td></tr>
+      <tr><td style="padding:40px 48px;">
+        <p style="color:#0F2235;font-size:16px;margin:0 0 12px;">Bonjour,</p>
+        <p style="color:#4A5568;font-size:14px;line-height:1.6;margin:0 0 28px;">
+          <strong>{invitant_nom}</strong> souhaite vous inviter à rejoindre l'équipe
+          d'administration de la plateforme <strong>EasyVoyage</strong>.
+        </p>
+        <p style="color:#4A5568;font-size:14px;margin:0 0 16px;">Votre code de vérification :</p>
+        <div style="text-align:center;margin:28px 0;">
+          <span style="display:inline-block;background:#EEF2F7;border:2px dashed #C4973A;
+            border-radius:14px;padding:18px 48px;
+            font-size:36px;font-weight:bold;color:#0F2235;letter-spacing:12px;
+            font-family:'Courier New',monospace;">
+            {code}
+          </span>
+        </div>
+        <p style="color:#8A9BB0;font-size:13px;text-align:center;margin:0 0 28px;">
+          ⏱ Ce code expire dans <strong style="color:#C0392B;">15 minutes</strong>.
+        </p>
+        <p style="color:#4A5568;font-size:14px;line-height:1.6;margin:0 0 12px;">
+          Communiquez ce code au Super Administrateur pour finaliser la création
+          de votre compte. Vous recevrez ensuite vos identifiants par email.
+        </p>
+        <div style="background:#FFF8EC;border:1px solid rgba(196,151,58,0.3);
+                    border-radius:10px;padding:14px 18px;margin-top:20px;">
+          <p style="color:#8A6914;font-size:13px;margin:0;line-height:1.5;">
+            🔒 <strong>Sécurité :</strong> Si vous n'êtes pas à l'origine de
+            cette invitation, ignorez simplement cet email.
+          </p>
+        </div>
+      </td></tr>
+      <tr><td style="background:#F8FAFC;padding:20px 48px;text-align:center;border-top:1px solid #EEF2F7;">
+        <p style="color:#B0BEC8;font-size:11px;margin:0;">
+          EasyVoyage Administration — www.easyvoyage.tn
+        </p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body></html>
+"""
+    await send_email(to, "Invitation Administrateur — EasyVoyage", html)
+
+
+# ══════════════════════════════════════════════════════════
+#  ✨ NEW : BIENVENUE ADMIN
+# ══════════════════════════════════════════════════════════
+
+async def send_welcome_admin_email(
+    to: str, prenom: str, nom: str, password: str
+) -> None:
+    """Email de bienvenue avec mot de passe temporaire pour le nouvel administrateur."""
+    html = f"""
+<!DOCTYPE html>
+<html><body style="font-family:Arial,sans-serif;background:#f4f6f8;margin:0;padding:0;">
+<table width="100%" cellpadding="0" cellspacing="0">
+  <tr><td align="center" style="padding:40px 20px;">
+    <table width="560" style="background:white;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+      <tr><td style="background:linear-gradient(135deg,#0F2235,#1A3F63);padding:32px;text-align:center;">
+        <h1 style="color:white;font-size:24px;margin:0;font-family:'Georgia',serif;">
+          Bienvenue dans l'équipe
+        </h1>
+        <p style="color:#C4973A;margin:8px 0 0;font-size:13px;letter-spacing:2px;text-transform:uppercase;">
+          Votre compte administrateur est activé
+        </p>
+      </td></tr>
+      <tr><td style="padding:40px 48px;">
+        <p style="color:#0F2235;font-size:16px;margin:0 0 12px;">
+          Bonjour <strong>{prenom} {nom}</strong>,
+        </p>
+        <p style="color:#4A5568;font-size:14px;line-height:1.6;margin:0 0 28px;">
+          Votre compte administrateur sur <strong>EasyVoyage</strong> a été créé
+          avec succès. Voici vos identifiants de connexion :
+        </p>
+        <table width="100%" style="background:#F8FAFC;border-radius:12px;padding:0;margin-bottom:28px;">
+          <tr>
+            <td style="padding:16px 24px;border-bottom:1px solid #EEF2F7;">
+              <span style="color:#8A9BB0;font-size:12px;font-weight:bold;text-transform:uppercase;letter-spacing:0.5px;">
+                Email
+              </span><br>
+              <span style="color:#0F2235;font-size:15px;font-weight:600;">{to}</span>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:16px 24px;">
+              <span style="color:#8A9BB0;font-size:12px;font-weight:bold;text-transform:uppercase;letter-spacing:0.5px;">
+                Mot de passe temporaire
+              </span><br>
+              <span style="display:inline-block;background:#EEF2F7;border:1.5px solid #C4973A;
+                border-radius:8px;padding:8px 18px;margin-top:4px;
+                font-size:18px;font-weight:bold;color:#0F2235;letter-spacing:3px;
+                font-family:'Courier New',monospace;">
+                {password}
+              </span>
+            </td>
+          </tr>
+        </table>
+        <div style="background:#FEF2F2;border:1px solid #FCA5A5;
+                    border-radius:10px;padding:14px 18px;margin-bottom:24px;">
+          <p style="color:#991B1B;font-size:13px;margin:0;line-height:1.5;">
+            ⚠️ <strong>Important :</strong> Pour la sécurité de la plateforme,
+            <strong>changez votre mot de passe dès votre première connexion</strong>
+            depuis votre profil.
+          </p>
+        </div>
+        <p style="color:#4A5568;font-size:14px;line-height:1.6;margin:0 0 28px;">
+          En tant qu'administrateur, vous avez accès à la gestion des partenaires,
+          des réservations, des promotions, des finances et bien plus encore.
+        </p>
+        <div style="text-align:center;margin:30px 0 8px;">
+          <a href="http://localhost:3000"
+             style="display:inline-block;background:linear-gradient(135deg,#0F2235,#1A3F63);
+                    color:white;text-decoration:none;padding:14px 36px;
+                    border-radius:10px;font-weight:bold;font-size:14px;">
+            Se connecter à l'espace administrateur
+          </a>
+        </div>
+      </td></tr>
+      <tr><td style="background:#F8FAFC;padding:20px 48px;text-align:center;border-top:1px solid #EEF2F7;">
+        <p style="color:#B0BEC8;font-size:11px;margin:0;">
+          EasyVoyage Administration — www.easyvoyage.tn
+        </p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body></html>
+"""
+    await send_email(to, "Bienvenue dans l'équipe Admin — EasyVoyage", html)
+
+
+# ══════════════════════════════════════════════════════════
 #  VOUCHER PDF PAR EMAIL — VISITEUR
 # ══════════════════════════════════════════════════════════
 

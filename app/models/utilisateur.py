@@ -3,7 +3,7 @@ ORM models for the user hierarchy:
   Utilisateur  (super-class)
   ├── Client
   ├── Partenaire
-  └── Admin
+  └── Admin    (✨ avec is_super_admin)
 """
 import enum
 from datetime import datetime
@@ -120,10 +120,17 @@ class Admin(Base):
         ForeignKey("utilisateur.id", ondelete="CASCADE", onupdate="CASCADE"),
         primary_key=True,
     )
+    # ✨ NEW : Marqueur Super Admin
+    # Seul un Super Admin peut créer / modifier / supprimer d'autres admins.
+    # Un Super Admin ne peut pas être désactivé ou supprimé par un admin standard.
+    is_super_admin: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     utilisateur: Mapped[Utilisateur] = relationship("Utilisateur", back_populates="admin")
 
     def __repr__(self) -> str:
-        return f"<Admin id={self.id}>"
+        flag = " [SUPER]" if self.is_super_admin else ""
+        return f"<Admin id={self.id}{flag}>"

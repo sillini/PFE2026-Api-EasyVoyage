@@ -8,6 +8,8 @@ Authentication endpoints:
   GET   /api/v1/auth/me                    — Get current user profile
   POST  /api/v1/auth/logout                — Logout (client-side token invalidation)
 """
+import logging
+
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,7 +25,11 @@ from app.schemas.auth import (
     UserMeResponse,
 )
 import app.services.auth_service as auth_service
-from app.services.contact_service import upsert_contact   # ← NOUVEAU
+from app.services.contact_service import upsert_contact
+# ✨ NEW : Helper notification (utilisé pour Google OAuth)
+from app.services.notification_helper import notify_all_admins, NotifType
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -42,7 +48,6 @@ async def register_client(
     token_response = await auth_service.register_client(data, session)
 
     # ── Sync contact ──────────────────────────────────────
-    # Récupérer l'utilisateur créé pour obtenir son id
     user = await auth_service._get_user_by_email(session, data.email)
     if user:
         await upsert_contact(
@@ -129,8 +134,6 @@ async def me(
 async def logout(
     _: TokenData = Depends(get_current_user),
 ) -> None:
-    # JWT is stateless. Client must discard both tokens.
-    # Future: add token to Redis blacklist here.
     return
 
 
@@ -239,7 +242,10 @@ async def google_auth(
 
     # 2. Chercher ou créer l'utilisateur
     user = await auth_service._get_user_by_email(session, email)
+    is_new_user = False
+
     if not user:
+        is_new_user = True
         user = _Utilisateur(
             nom          = nom    or email.split("@")[0],
             prenom       = prenom or "Utilisateur",
@@ -264,5 +270,17 @@ async def google_auth(
             source_id = user.id,
         )
         await session.commit()
+
+        # ✨ NEW : Notifier les admins du nouveau client (Google OAuth)
+        try:
+            await notify_all_admins(
+                session,
+                type_   = NotifType.NOUVEAU_CLIENT,
+                titre   = "Nouveau client inscrit (Google)",
+                message = f"{user.prenom} {user.nom} ({user.email}) vient de créer un compte via Google",
+            )
+            await session.commit()
+        except Exception as exc:
+            logger.warning(f"[NOTIF] Échec création notif Google OAuth : {exc}")
 
     return auth_service._build_token_response(user)

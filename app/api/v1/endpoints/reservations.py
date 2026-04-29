@@ -9,6 +9,7 @@ Routes :
                                                       + création automatique de la facture
                                                       + application automatique des promotions
                                                       + calcul fiscal dynamique (taxe séjour, TVA, timbre)
+                                                      + ✨ notification aux admins
   GET   /reservations/mes-reservations              → Mes réservations [CLIENT]
   GET   /reservations                               → Toutes [ADMIN]
   GET   /reservations/admin/enrichi                 → Clients + Visiteurs enrichis [ADMIN]
@@ -29,6 +30,7 @@ from typing import Optional, List
 import asyncio as _asyncio
 import uuid as _uuid
 import io as _io
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse as _SR
@@ -59,6 +61,10 @@ from app.models.voyage import Voyage as _Voyage
 from app.services.email_service import send_voucher_email as _send_voucher_email
 from app.services.contact_service import upsert_contact
 import app.services.reservation_service as reservation_service
+# ✨ NEW : Helper de notification centralisé
+from app.services.notification_helper import notify_all_admins, NotifType
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/reservations", tags=["Réservations"])
 
@@ -220,14 +226,12 @@ async def reserver_visiteur(
         nb_adultes        = data.nb_adultes,
         nb_enfants        = data.nb_enfants,
         total_ttc         = fiscal.total_ttc,
-        # ── Détail fiscal stocké ────────────────────────────
         montant_ht        = fiscal.montant_ht,
         taxe_sejour       = fiscal.taxe_sejour,
         tva_montant       = fiscal.tva_montant,
         taux_tva          = fiscal.taux_tva,
         droit_timbre      = fiscal.droit_timbre,
         nb_nuits_taxables = fiscal.nb_nuits_taxables,
-        # ───────────────────────────────────────────────────
         methode_paiement  = data.methode,
         transaction_id    = "T-" + _uuid.uuid4().hex[:8].upper(),
         statut            = "CONFIRMEE",
@@ -265,6 +269,27 @@ async def reserver_visiteur(
         type      = "visiteur",
         source_id = resa.id,
     )
+
+    # ── ✨ 6d. NOUVEAU : Notifier tous les admins ──────────
+    # On le fait AVANT le commit pour que les notifs soient
+    # persistées dans la même transaction
+    try:
+        h_notif = await session.execute(_sel(_H).where(_H.id == chambre.id_hotel))
+        hotel_notif = h_notif.scalar_one_or_none()
+        hotel_nom_n = hotel_notif.nom if hotel_notif else "un hôtel"
+
+        await notify_all_admins(
+            session,
+            type_   = NotifType.NOUVELLE_RESERVATION_VISITEUR,
+            titre   = "Nouvelle réservation visiteur",
+            message = (
+                f"{data.prenom} {data.nom} a réservé "
+                f"{hotel_nom_n} ({fiscal.total_ttc:.2f} DT)"
+            ),
+        )
+    except Exception as exc:
+        # Ne jamais bloquer la création à cause d'une notif
+        logger.warning(f"[NOTIF] Échec création notif réservation visiteur : {exc}")
 
     await session.commit()
     await session.refresh(resa)
@@ -1187,9 +1212,6 @@ async def download_facture_visiteur_admin(
     num_doc       = resa.facture.numero if resa.facture else resa.numero_voucher
     date_emission = getattr(resa, "created_at", None) or datetime.now()
 
-    # ── Prix HT unitaire pour la ligne prestations ─────────
-    # Utiliser montant_ht stocké si disponible (nouvelle facture),
-    # sinon fallback sur total_ttc / 1.07 (ancienne facture sans détail fiscal)
     montant_ht_val = float(resa.montant_ht) if resa.montant_ht else round(total_ttc_val / 1.07, 3)
     prix_ht_nuit   = round(montant_ht_val / nb_nuits, 3)
 
@@ -1201,7 +1223,6 @@ async def download_facture_visiteur_admin(
         "quantite":      nb_nuits,
     }]
 
-    # ── Paramètres fiscaux depuis la DB (None si ancienne réservation) ────────
     pdf_bytes = generer_facture_pdf(
         numero_facture    = num_doc,
         date_emission     = date_emission,
@@ -1215,7 +1236,6 @@ async def download_facture_visiteur_admin(
         nb_nuits          = nb_nuits,
         prestations       = prestations,
         total_ttc         = total_ttc_val,
-        # ── Détail fiscal dynamique ────────────────────────
         montant_ht        = float(resa.montant_ht)        if resa.montant_ht        else None,
         taxe_sejour       = float(resa.taxe_sejour)       if resa.taxe_sejour       else None,
         nb_nuits_taxables = resa.nb_nuits_taxables,

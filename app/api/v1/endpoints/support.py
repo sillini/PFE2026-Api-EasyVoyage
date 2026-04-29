@@ -18,8 +18,11 @@ Admin :
 
 Commun :
   GET    /support/notifications                               → mes notifications
-  PATCH  /support/notifications/{id}/read                    → marquer lue
-  PATCH  /support/notifications/read-all                     → tout marquer lu
+  PATCH  /support/notifications/{id}/read                     → marquer lue
+  PATCH  /support/notifications/read-all                      → tout marquer lu
+  ✨ GET     /support/notifications/unread-count              → compteur léger
+  ✨ DELETE  /support/notifications/{id}                      → supprimer une notif
+  ✨ DELETE  /support/notifications/read/all                  → vider les notifs lues
 """
 from fastapi import APIRouter, Depends, Query
 from typing import Optional
@@ -32,7 +35,7 @@ from app.schemas.support import (
     ConversationCreate, ConversationListResponse, ConversationResponse,
     MessageCreate, MessageResponse,
     NotificationListResponse,
-    AdminConversationCreate,        # ← nouveau schéma
+    AdminConversationCreate,
 )
 import app.services.support_service as svc
 
@@ -237,3 +240,41 @@ async def mark_all_read(
     current: TokenData = Depends(get_current_user),
 ):
     return await svc.mark_all_notifications_read(current.user_id, session)
+
+
+# ══════════════════════════════════════════════════════════
+#  ✨ NOTIFICATIONS — COMPTEUR + SUPPRESSION (NEW)
+# ══════════════════════════════════════════════════════════
+
+@router.get(
+    "/support/notifications/unread-count",
+    summary="Nombre de notifications non lues (léger, pour polling)",
+)
+async def unread_count(
+    session: AsyncSession = Depends(get_db),
+    current: TokenData = Depends(get_current_user),
+):
+    return await svc.count_unread_notifications(current.user_id, session)
+
+
+@router.delete(
+    "/support/notifications/read/all",
+    summary="Supprimer toutes les notifications lues",
+)
+async def delete_read_notifs(
+    session: AsyncSession = Depends(get_db),
+    current: TokenData = Depends(get_current_user),
+):
+    return await svc.delete_all_read_notifications(current.user_id, session)
+
+
+@router.delete(
+    "/support/notifications/{notif_id}",
+    summary="Supprimer une notification",
+)
+async def delete_notif(
+    notif_id: int,
+    session: AsyncSession = Depends(get_db),
+    current: TokenData = Depends(get_current_user),
+):
+    return await svc.delete_notification(notif_id, current.user_id, session)

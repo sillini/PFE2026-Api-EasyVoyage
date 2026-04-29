@@ -85,6 +85,10 @@ class UserMeResponse(BaseModel):
     commission: float | None = None
     statut_partenaire: str | None = None
 
+    # ✨ NEW : flag Super Admin (utilisé par le frontend pour afficher
+    #          la section "Administrateurs" dans la sidebar)
+    is_super_admin: Optional[bool] = False
+
     model_config = {"from_attributes": True}
 
 

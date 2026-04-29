@@ -16,6 +16,8 @@ CORRECTIONS APPLIQUÉES :
   - _send_profile_otp : labels adaptés pour CLIENT + try/except SMTP
     (ne crashe plus si Brevo est injoignable → plus de "Failed to fetch")
   - request_email_change / request_password_change : labels rôle CLIENT
+  - ✨ register_client : notifie tous les admins de la nouvelle inscription
+  - ✨ get_current_user_profile : remplit is_super_admin pour les admins
 """
 import logging
 from datetime import datetime, timedelta, timezone
@@ -52,6 +54,8 @@ from app.schemas.auth import (
     TokenResponse,
     UserMeResponse,
 )
+# ✨ NEW : Helper de notification centralisé
+from app.services.notification_helper import notify_all_admins, NotifType
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +117,19 @@ async def register_client(
 
     client = Client(id=user.id)
     session.add(client)
+    await session.flush()
+
+    # ✨ NEW : Notifier tous les admins de la nouvelle inscription
+    try:
+        await notify_all_admins(
+            session,
+            type_   = NotifType.NOUVEAU_CLIENT,
+            titre   = "Nouveau client inscrit",
+            message = f"{data.prenom} {data.nom} ({data.email}) vient de créer un compte",
+        )
+    except Exception as exc:
+        # Ne jamais bloquer l'inscription à cause d'une notif
+        logger.warning(f"[NOTIF] Échec création notif nouveau client : {exc}")
 
     return _build_token_response(user)
 
@@ -211,6 +228,11 @@ async def get_current_user_profile(
         response.type_partenaire   = p.type_partenaire
         response.commission        = float(p.commission)
         response.statut_partenaire = p.statut
+
+    # ✨ NEW : flag is_super_admin (utilisé côté frontend pour afficher
+    #          la section "Administrateurs" dans la sidebar)
+    if user.admin:
+        response.is_super_admin = bool(user.admin.is_super_admin)
 
     return response
 
@@ -371,12 +393,6 @@ async def _send_profile_otp(to: str, code: str, action: str, role: str = "ADMIN"
 </body></html>"""
 
     # ── CORRECTION CRITIQUE : try/except autour de send_email ──────────────
-    # Sans ce bloc, si SMTP Brevo est injoignable (timeout, mauvais credentials,
-    # réseau, etc.), l'exception remonte jusqu'à l'endpoint FastAPI → 500
-    # → la connexion est fermée brutalement → le frontend reçoit "Failed to fetch"
-    # Avec ce bloc : on log l'erreur mais l'endpoint répond 200 normalement.
-    # Le code OTP est déjà sauvegardé en DB, l'utilisateur peut réessayer.
-    # En mode dev (SMTP_PASSWORD vide), le code est affiché dans les logs uvicorn.
     try:
         await send_email(to, f"Code de confirmation — {action_label}", html)
         logger.info(f"[OTP] Email envoyé à {to} pour {action_label}")
@@ -386,7 +402,6 @@ async def _send_profile_otp(to: str, code: str, action: str, role: str = "ADMIN"
             f"[OTP] 💡 En mode dev, cherchez le code dans les logs ci-dessus "
             f"(ligne [EMAIL SIMULÉ]) ou vérifiez SMTP_HOST/SMTP_PASSWORD dans .env"
         )
-        # On ne re-lève PAS l'exception → l'endpoint continue normalement
 
 
 # ══════════════════════════════════════════════════════════
@@ -434,12 +449,10 @@ async def request_email_change(
     Étape 1 : vérifie que le nouvel email est libre,
     génère un OTP et l'envoie au NOUVEL email via Brevo.
     """
-    # Vérifier que le nouvel email n'est pas déjà pris
     existing = await _get_user_by_email(session, new_email)
     if existing and existing.id != user_id:
         raise ConflictException("Cet email est déjà utilisé par un autre compte")
 
-    # Récupérer l'utilisateur pour connaître son rôle
     result = await session.execute(
         select(Utilisateur).where(Utilisateur.id == user_id)
     )
@@ -447,13 +460,11 @@ async def request_email_change(
     if not user:
         raise NotFoundException("Utilisateur introuvable")
 
-    role = user.role.value  # "CLIENT", "PARTENAIRE" ou "ADMIN"
+    role = user.role.value
 
-    # Sauvegarder l'OTP (tag unique pour ce changement d'email précis)
     tag = f"chg_{new_email}"
     code = await _save_otp(tag, session)
 
-    # Envoyer l'email (ne crashe pas si SMTP échoue)
     await _send_profile_otp(new_email, code, "email", role)
 
     return {"message": f"Code envoyé à {new_email}", "email": new_email}
@@ -501,13 +512,11 @@ async def request_password_change(user_id: int, session: AsyncSession) -> dict:
     if not user:
         raise NotFoundException("Utilisateur introuvable")
 
-    role = user.role.value  # "CLIENT", "PARTENAIRE" ou "ADMIN"
+    role = user.role.value
 
-    # Tag unique pour le changement de mot de passe de cet utilisateur
     tag = f"pwd_{user.email}"
     code = await _save_otp(tag, session)
 
-    # Envoyer l'email (ne crashe pas si SMTP échoue)
     await _send_profile_otp(user.email, code, "password", role)
 
     return {"message": f"Code envoyé à {user.email}", "email": user.email}
@@ -536,7 +545,3 @@ async def confirm_password_change(
 
     logger.info(f"[PROFIL] Mot de passe modifié pour user_id={user_id}")
     return {"message": "Mot de passe modifié avec succès"}
-
-
-
-

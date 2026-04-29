@@ -11,6 +11,9 @@ Flux :
   4. L'admin ou le partenaire peut fermer (statut FERMEE)
 
   5. [NOUVEAU] Admin peut créer directement une conversation (statut ACCEPTEE d'emblée)
+
+  6. ✨ [NOUVEAU] Compteur unread + suppression individuelle/en masse
+     → utilisé par la page AdminNotifications + badge sidebar
 """
 from datetime import datetime, timezone
 from typing import Optional, List
@@ -46,7 +49,6 @@ async def _user_compact(u: Optional[Utilisateur], session: AsyncSession) -> Opti
 
     hotels_noms: List[str] = []
 
-    # Charger les noms d'hôtels uniquement pour les partenaires
     if hasattr(u, "role") and str(u.role).upper() in ("PARTENAIRE", "RoleUtilisateur.PARTENAIRE"):
         try:
             from app.models.hotel import Hotel
@@ -82,7 +84,6 @@ async def _count_non_lus(conv_id: int, reader_id: int, session: AsyncSession) ->
 
 
 def _to_msg(m: SupportMessage) -> MessageResponse:
-    # Pour les messages, on utilise UserCompact basique (sans hotels_noms)
     exp = None
     if m.expediteur:
         exp = UserCompact(
@@ -106,7 +107,6 @@ def _to_msg(m: SupportMessage) -> MessageResponse:
 async def _to_conv(c: SupportConversation, reader_id: int, session: AsyncSession) -> ConversationResponse:
     nb = await _count_non_lus(c.id, reader_id, session)
 
-    # Enrichir le partenaire avec email + hotels_noms
     partenaire_compact = await _user_compact(c.partenaire, session)
     admin_compact      = await _user_compact(c.admin, session) if c.admin else None
 
@@ -238,7 +238,6 @@ async def admin_create_conversation(
     - Premier message optionnel
     - Notification envoyée au partenaire
     """
-    # Vérifier que le partenaire existe et est actif
     part_res = await session.execute(
         select(Utilisateur).where(
             Utilisateur.id    == data.id_partenaire,
@@ -249,7 +248,6 @@ async def admin_create_conversation(
     if not partenaire:
         raise NotFoundException(f"Partenaire {data.id_partenaire} introuvable ou inactif")
 
-    # Créer la conversation directement ACCEPTEE
     conv = SupportConversation(
         id_partenaire = data.id_partenaire,
         id_admin      = admin_id,
@@ -259,14 +257,12 @@ async def admin_create_conversation(
     session.add(conv)
     await session.flush()
 
-    # Charger l'admin pour la notification
     admin_res = await session.execute(
         select(Utilisateur).where(Utilisateur.id == admin_id)
     )
     admin = admin_res.scalar_one_or_none()
     admin_nom = f"{admin.prenom} {admin.nom}" if admin else "L'administrateur"
 
-    # Notifier le partenaire
     await _create_notif(
         session,
         data.id_partenaire,
@@ -276,7 +272,6 @@ async def admin_create_conversation(
         conv.id,
     )
 
-    # Envoyer le premier message si fourni
     if data.premier_message and data.premier_message.strip():
         msg = SupportMessage(
             id_conversation = conv.id,
@@ -287,7 +282,6 @@ async def admin_create_conversation(
 
     await session.flush()
 
-    # Recharger avec toutes les relations
     result = await session.execute(
         select(SupportConversation)
         .options(
@@ -323,7 +317,6 @@ async def accept_conversation(
     conv.updated_at = datetime.now(timezone.utc)
     await session.flush()
 
-    # Notifier le partenaire
     await _create_notif(
         session, conv.id_partenaire,
         "CONVERSATION_ACCEPTEE",
@@ -333,7 +326,6 @@ async def accept_conversation(
     )
     await session.flush()
 
-    # Recharger
     result2 = await session.execute(
         select(SupportConversation)
         .options(
@@ -368,7 +360,6 @@ async def close_conversation(
     conv.updated_at = datetime.now(timezone.utc)
     await session.flush()
 
-    # Notifier l'autre partie
     autre_id = conv.id_admin if user_id == conv.id_partenaire else conv.id_partenaire
     if autre_id:
         await _create_notif(
@@ -404,7 +395,6 @@ async def get_conversation_messages(
     if conv.id_partenaire != user_id and conv.id_admin != user_id:
         raise ForbiddenException("Accès refusé")
 
-    # Marquer les messages comme lus
     for msg in conv.messages:
         if not msg.lu and msg.id_expediteur != user_id:
             msg.lu = True
@@ -442,7 +432,6 @@ async def send_message(
     await session.flush()
     await session.refresh(msg)
 
-    # Charger expéditeur
     result2 = await session.execute(
         select(SupportMessage)
         .options(selectinload(SupportMessage.expediteur))
@@ -450,7 +439,6 @@ async def send_message(
     )
     msg = result2.scalar_one()
 
-    # Notifier le destinataire
     dest_id = conv.id_admin if sender_id == conv.id_partenaire else conv.id_partenaire
     if dest_id:
         sender_nom = f"{msg.expediteur.prenom} {msg.expediteur.nom}" if msg.expediteur else "Quelqu'un"
@@ -476,7 +464,7 @@ async def get_notifications(
         select(Notification)
         .where(Notification.id_destinataire == user_id)
         .order_by(Notification.created_at.desc())
-        .limit(50)
+        .limit(200)   # ✨ augmenté de 50 → 200 pour la page dédiée
     )
     notifs = result.scalars().all()
     items = [
@@ -522,3 +510,55 @@ async def mark_all_notifications_read(user_id: int, session: AsyncSession):
         notif.lue = True
     await session.flush()
     return {"ok": True}
+
+
+# ══════════════════════════════════════════════════════════
+#  ✨ NOTIFICATIONS — COMPTEUR & SUPPRESSION (NEW)
+# ══════════════════════════════════════════════════════════
+
+async def count_unread_notifications(
+    user_id: int, session: AsyncSession
+) -> dict:
+    """Retourne juste le nombre de notifications non lues (léger pour polling)."""
+    result = await session.execute(
+        select(func.count(Notification.id)).where(
+            Notification.id_destinataire == user_id,
+            Notification.lue == False,
+        )
+    )
+    return {"unread": int(result.scalar_one() or 0)}
+
+
+async def delete_notification(
+    notif_id: int, user_id: int, session: AsyncSession
+) -> dict:
+    """Supprime DÉFINITIVEMENT une notification (uniquement la sienne)."""
+    result = await session.execute(
+        select(Notification).where(
+            Notification.id == notif_id,
+            Notification.id_destinataire == user_id,
+        )
+    )
+    notif = result.scalar_one_or_none()
+    if notif:
+        await session.delete(notif)
+        await session.flush()
+    return {"ok": True}
+
+
+async def delete_all_read_notifications(
+    user_id: int, session: AsyncSession
+) -> dict:
+    """Supprime toutes les notifications LUES de l'utilisateur."""
+    result = await session.execute(
+        select(Notification).where(
+            Notification.id_destinataire == user_id,
+            Notification.lue == True,
+        )
+    )
+    deleted = 0
+    for notif in result.scalars().all():
+        await session.delete(notif)
+        deleted += 1
+    await session.flush()
+    return {"ok": True, "deleted": deleted}

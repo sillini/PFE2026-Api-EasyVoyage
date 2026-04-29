@@ -12,6 +12,7 @@ from app.api.v1.endpoints import factures
 from app.api.v1.endpoints import factures_admin
 from app.api.v1.endpoints import marketing
 from app.api.v1.endpoints import partenaires
+from app.api.v1.endpoints import admins                        # ← ✨ NEW
 from app.api.v1.endpoints import hero_slides
 from app.api.v1.endpoints import support
 from app.api.v1.endpoints import clients
@@ -52,6 +53,7 @@ api_v1_router.include_router(factures.router)
 
 api_v1_router.include_router(marketing.router)
 api_v1_router.include_router(partenaires.router)
+api_v1_router.include_router(admins.router)                    # ← ✨ NEW : Super Admin
 api_v1_router.include_router(hero_slides.router)
 api_v1_router.include_router(support.router)
 api_v1_router.include_router(clients.router)
