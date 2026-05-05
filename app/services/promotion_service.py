@@ -5,8 +5,13 @@ Service pour la gestion des promotions avec workflow de validation admin.
 
 Workflow :
   1. Partenaire crée → statut PENDING
-  2. Admin approuve  → statut APPROVED + email partenaire
-  3. Admin refuse    → statut REJECTED + email partenaire avec raison
+                     → notification ADMIN "Nouvelle promotion à valider"
+  2. Admin approuve  → statut APPROVED
+                     → email partenaire
+                     → ✨ notification PARTENAIRE "Promotion approuvée"
+  3. Admin refuse    → statut REJECTED + raison
+                     → email partenaire
+                     → ✨ notification PARTENAIRE "Promotion refusée"
   4. Côté visiteur   → seules les promos APPROVED + actif + dans dates sont visibles
 """
 from datetime import date, datetime, timezone
@@ -29,8 +34,12 @@ from app.schemas.promotion import (
     PromotionUpdate,
     UserMini,
 )
-# ✅ Helper de notification centralisé
-from app.services.notification_helper import notify_all_admins, NotifType
+# ✅ Helpers de notification centralisés
+from app.services.notification_helper import (
+    notify_all_admins,
+    notify_partenaire,   # ← AJOUT
+    NotifType,
+)
 
 # ═══════════════════════════════════════════════════════════
 #  HELPERS
@@ -276,6 +285,7 @@ async def get_promotion(
         raise ForbiddenException("Accès refusé")
     return _to_response(promo)
 
+
 async def create_promotion(
     hotel_id: int,
     data: PromotionCreate,
@@ -324,6 +334,7 @@ async def create_promotion(
 
     await session.commit()
     return _to_response(promo)
+
 
 async def update_promotion(
     promo_id: int,
@@ -427,7 +438,14 @@ async def traiter_promotion(
     admin_id: int,
     session: AsyncSession,
 ) -> PromotionResponse:
-    """Admin accepte ou refuse une promotion."""
+    """
+    Admin accepte ou refuse une promotion.
+
+    Side-effects :
+      - Met à jour le statut + date_decision + raison_refus
+      - Envoie un email au partenaire
+      - ✨ NEW : Crée une notification dans la cloche du partenaire
+    """
     promo = await _load_promo(promo_id, session)
 
     if promo.statut != StatutPromotion.PENDING:
@@ -456,6 +474,41 @@ async def traiter_promotion(
             raison_refus      = data.raison_refus,
         )
 
+    # ───────────────────────────────────────────────────────
+    # ✨ NEW : Notification cloche pour le partenaire
+    # ───────────────────────────────────────────────────────
+    try:
+        if data.action == "APPROVED":
+            await notify_partenaire(
+                session,
+                partenaire_id = promo.id_partenaire,
+                type_         = NotifType.PROMOTION_APPROUVEE,
+                titre         = "✅ Promotion approuvée",
+                message       = (
+                    f"Votre promotion « {promo.titre} » (-{int(promo.pourcentage)}%) "
+                    f"a été approuvée et est maintenant visible sur la plateforme."
+                ),
+            )
+        else:  # REJECTED
+            raison = data.raison_refus or "Aucune raison spécifiée"
+            await notify_partenaire(
+                session,
+                partenaire_id = promo.id_partenaire,
+                type_         = NotifType.PROMOTION_REFUSEE,
+                titre         = "❌ Promotion refusée",
+                message       = (
+                    f"Votre promotion « {promo.titre} » a été refusée. "
+                    f"Motif : {raison}"
+                ),
+            )
+        await session.commit()
+    except Exception as exc:
+        # Ne jamais bloquer à cause d'une notif
+        import logging
+        logging.getLogger(__name__).warning(
+            f"[NOTIF promo] Échec création notif partenaire : {exc}"
+        )
+
     return _to_response(promo)
 
 
@@ -479,32 +532,6 @@ async def toggle_actif_admin(
 # ═══════════════════════════════════════════════════════════
 #  FONCTIONS PUBLIQUES — Côté visiteur
 # ═══════════════════════════════════════════════════════════
-
-async def get_promotion_active_hotel(
-    hotel_id: int,
-    session: AsyncSession,
-) -> Optional[PromotionResponse]:
-    """
-    Retourne la meilleure promotion APPROVED + actif + dans dates pour un hôtel.
-    Seules les promotions approuvées sont visibles côté visiteur.
-    """
-    today = date.today()
-    result = await session.execute(
-        select(Promotion)
-        .options(selectinload(Promotion.hotel))
-        .where(
-            Promotion.id_hotel == hotel_id,
-            Promotion.statut   == StatutPromotion.APPROVED,
-            Promotion.actif    == True,
-            Promotion.date_debut <= today,
-            Promotion.date_fin   >= today,
-        )
-        .order_by(Promotion.pourcentage.desc())
-        .limit(1)
-    )
-    promo = result.scalar_one_or_none()
-    return _to_response(promo) if promo else None
-
 
 def calculer_prix_promo(prix: float, pourcentage: float) -> float:
     """Applique un pourcentage de réduction à un prix."""
@@ -586,7 +613,6 @@ async def get_promotion_active_hotel(
     """
     Retourne l'objet ORM Promotion APPROVED actif pour un hôtel.
     Compatibilité avec hotel_service.py (get_hotel, _to_hotel_response).
-    Pour les endpoints publics, utiliser get_promotion_active_hotel_response().
     """
     ref_date = at_date or date.today()
     result = await session.execute(
@@ -612,9 +638,6 @@ async def get_promotions_catalogue_admin(
     Variante pour les catalogues admin.
     Retourne toutes les promos APPROVED dans les dates,
     SANS filtrer sur actif — cohérent avec la liste UI admin.
-
-    Corrige le bug : la promo s'affiche dans la liste hôtels
-    du catalogue mais est ignorée par Claude AI car actif=False.
     """
     if not hotel_ids:
         return {}

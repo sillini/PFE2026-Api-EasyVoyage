@@ -17,8 +17,11 @@ Flux paiement :
   CONFIRMEE  → annuler() → ANNULEE   (facture → ANNULEE)
   CONFIRMEE  → PostgreSQL scheduler  → TERMINEE (quand date_fin < aujourd'hui)
 
-✅ AJOUT : notification automatique de TOUS les admins
-   à chaque nouvelle réservation (voyage ou chambre).
+Notifications :
+  ✅ Tous les admins notifiés à chaque nouvelle réservation
+  ✅ ✨ NEW : Le partenaire propriétaire de l'hôtel notifié à chaque
+       nouvelle réservation chambre (clients ET visiteurs)
+  ✅ ✨ NEW : Le partenaire notifié à chaque annulation de résa chambre
 """
 from datetime import date, datetime, timezone
 from typing import Optional
@@ -43,9 +46,14 @@ from app.schemas.reservation import (
     ReservationResponse,
     ReservationVoyageCreate,
 )
-# ✅ Helper de notification centralisé
-from app.services.notification_helper import notify_all_admins, NotifType
+# ✅ Helpers de notification centralisés
+from app.services.notification_helper import (
+    notify_all_admins,
+    notify_partenaire_for_hotel,   # ← AJOUT
+    NotifType,
+)
 from app.models.utilisateur import Utilisateur
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _nb_nuits(date_debut: date, date_fin: date) -> int:
@@ -84,8 +92,6 @@ async def _get_reservation_or_404(
 def _nb_personnes_from_resa(resa: Reservation, voyage: Voyage) -> int:
     """
     Retourne le nombre de personnes d'une réservation voyage.
-    Utilise nb_adultes + nb_enfants si disponibles (nouvelles réservations),
-    sinon calcule depuis total_ttc / prix_base (anciennes réservations migrées).
     """
     nb = (resa.nb_adultes or 0) + (resa.nb_enfants or 0)
     if nb > 0:
@@ -128,7 +134,6 @@ async def create_reservation_voyage(
     Crée une réservation pour un voyage.
     total_ttc = prix_base × nb_personnes (adultes + enfants).
     Vérifie la capacité disponible avant de créer.
-    Note : nb_inscrits est incrémenté au PAIEMENT, pas ici.
     """
     result = await session.execute(
         select(Voyage).where(Voyage.id == data.id_voyage, Voyage.actif == True)
@@ -201,6 +206,10 @@ async def create_reservation_chambres(
     PK ligne = (id_reservation, id_chambre) → chambre unique par réservation.
     total_ttc = Σ (tarif × nb_nuits) pour chaque chambre, avec application
     automatique de la promotion active de l'hôtel si elle existe.
+
+    Side-effects notifications :
+      - Notifie tous les admins (existant)
+      - ✨ NEW : Notifie chaque partenaire propriétaire des hôtels concernés
     """
     from app.services.promotion_service import (
         get_promotion_active_hotel,
@@ -223,6 +232,9 @@ async def create_reservation_chambres(
     total_ttc = 0.0
     promo_cache: dict = {}
 
+    # ✨ NEW : on garde une trace des hôtels concernés pour les notifs partenaires
+    hotels_concernes: set = set()
+
     async def _get_promo_for_hotel(hotel_id: int):
         if hotel_id not in promo_cache:
             promo_cache[hotel_id] = await get_promotion_active_hotel(
@@ -240,6 +252,9 @@ async def create_reservation_chambres(
 
         if ligne.nb_adultes + ligne.nb_enfants < 1:
             raise ConflictException(f"Chambre {ligne.id_chambre} : au moins 1 occupant requis")
+
+        # ✨ NEW : mémoriser l'hôtel pour la notif partenaire
+        hotels_concernes.add(chambre.id_hotel)
 
         r_tarif = await session.execute(
             select(Tarif)
@@ -279,7 +294,7 @@ async def create_reservation_chambres(
     resa.total_ttc = round(total_ttc, 2)
     await session.flush()
 
-    # 🔔 Notifier tous les admins
+    # 🔔 Notifier tous les admins ET les partenaires concernés
     try:
         client = (await session.execute(
             select(Utilisateur).where(Utilisateur.id == client_id)
@@ -287,12 +302,27 @@ async def create_reservation_chambres(
         client_nom = f"{client.prenom} {client.nom}" if client else "Un client"
         nb_chambres = len(data.chambres)
 
+        # 1. Notif admins (existant)
         await notify_all_admins(
             session,
             type_   = NotifType.NOUVELLE_RESERVATION,
             titre   = "Nouvelle réservation hôtel",
             message = f"{client_nom} a réservé {nb_chambres} chambre{'s' if nb_chambres > 1 else ''} ({total_ttc:.2f} DT)",
         )
+
+        # 2. ✨ NEW : Notif partenaire(s) propriétaire(s) des hôtels concernés
+        for hotel_id in hotels_concernes:
+            await notify_partenaire_for_hotel(
+                session,
+                hotel_id = hotel_id,
+                type_    = NotifType.NOUVELLE_RESERVATION_HOTEL,
+                titre    = "🎉 Nouvelle réservation",
+                message  = (
+                    f"{client_nom} a réservé du "
+                    f"{data.date_debut.strftime('%d/%m/%Y')} au "
+                    f"{data.date_fin.strftime('%d/%m/%Y')} ({total_ttc:.2f} DT)"
+                ),
+            )
     except Exception:
         pass  # ne jamais bloquer la création
 
@@ -353,14 +383,13 @@ async def payer_reservation(
     nb_nuits = _nb_nuits(resa.date_debut, resa.date_fin)
 
     if resa.id_voyage:
-        # Voyage : TVA + droit de timbre uniquement (pas de taxe de séjour)
         fiscal = await calculer_fiscal_voyage(
             montant_ht = float(resa.total_ttc),
             session    = session,
         )
     else:
         # Chambre hôtel : récupérer les étoiles pour appliquer la bonne taxe de séjour
-        etoiles = 3  # valeur par défaut
+        etoiles = 3
         if resa.lignes_chambres:
             ch_res = await session.execute(
                 select(Chambre)
@@ -422,6 +451,7 @@ async def payer_reservation(
 # ═══════════════════════════════════════════════════════════
 #  ANNULER
 #  ► Pour voyage CONFIRMEE : décrémente nb_inscrits du voyage
+#  ► ✨ NEW : Notifie le(s) partenaire(s) si résa hôtel
 # ═══════════════════════════════════════════════════════════
 async def annuler_reservation(
     reservation_id: int, client_id: int, role: str, session: AsyncSession
@@ -446,6 +476,38 @@ async def annuler_reservation(
             nb_personnes = _nb_personnes_from_resa(resa, voyage)
             voyage.nb_inscrits = max(0, (voyage.nb_inscrits or 0) - nb_personnes)
             await session.flush()
+
+    # ── ✨ NEW : Notifier les partenaires si résa hôtel ─────────────────────
+    if not resa.id_voyage and resa.lignes_chambres:
+        try:
+            client = (await session.execute(
+                select(Utilisateur).where(Utilisateur.id == resa.id_client)
+            )).scalar_one_or_none()
+            client_nom = f"{client.prenom} {client.nom}" if client else "Un client"
+
+            # Récupérer les hôtels uniques concernés
+            hotels_concernes = set()
+            for ligne in resa.lignes_chambres:
+                ch = (await session.execute(
+                    select(Chambre).where(Chambre.id == ligne.id_chambre)
+                )).scalar_one_or_none()
+                if ch:
+                    hotels_concernes.add(ch.id_hotel)
+
+            for hotel_id in hotels_concernes:
+                await notify_partenaire_for_hotel(
+                    session,
+                    hotel_id = hotel_id,
+                    type_    = NotifType.RESERVATION_ANNULEE,
+                    titre    = "⚠️ Réservation annulée",
+                    message  = (
+                        f"{client_nom} a annulé sa réservation prévue du "
+                        f"{resa.date_debut.strftime('%d/%m/%Y')} au "
+                        f"{resa.date_fin.strftime('%d/%m/%Y')}"
+                    ),
+                )
+        except Exception:
+            pass  # ne jamais bloquer l'annulation
 
     resa.statut = StatutReservation.ANNULEE
     if resa.facture:

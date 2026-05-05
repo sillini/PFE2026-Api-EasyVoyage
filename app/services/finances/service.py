@@ -11,10 +11,13 @@ RÈGLES MÉTIER :
 
 NOUVEAUTÉS :
   - payer_partenaire()         : génère PDF + envoie email automatiquement
+                                 + ✨ NEW : notifie le partenaire dans la cloche
   - valider_demande_retrait()  : idem (déjà fait)
+                                 + ✨ NEW : notif RETRAIT_APPROUVE au partenaire
+  - refuser_demande_retrait()  : refuse une demande
+                                 + ✨ NEW : notif RETRAIT_REFUSE au partenaire
   - get_historique_paiements() : expose id, numero_facture, has_pdf
   - get_demandes_retrait()     : liste admin des demandes de retrait
-  - refuser_demande_retrait()  : refuse une demande
 """
 from __future__ import annotations
 
@@ -66,6 +69,12 @@ from app.services.finances.utils import (
     calc_part_partenaire,
     calc_solde_restant,
     TAUX_COMMISSION_DEFAULT,
+)
+
+# ✅ Helper de notification centralisé (admins + partenaires)
+from app.services.notification_helper import (
+    notify_partenaire,
+    NotifType,
 )
 
 _MOIS_NOMS = ["Jan", "Fév", "Mar", "Avr", "Mai", "Jun",
@@ -628,6 +637,7 @@ async def get_soldes_partenaires(session: AsyncSession) -> SoldesPartenairesResp
 # ═══════════════════════════════════════════════════════════
 #  PAYER UN PARTENAIRE (paiement direct admin)
 #  ✅ Génère la facture PDF + envoie email automatiquement
+#  ✅ ✨ NEW : Notifie le partenaire dans la cloche
 # ═══════════════════════════════════════════════════════════
 
 async def payer_partenaire(
@@ -749,6 +759,23 @@ async def payer_partenaire(
         numero_facture = numero_facture,
         pdf_data       = pdf_bytes,
     ))
+
+    # ── 11. ✨ NEW : Notifier le partenaire dans la cloche ──
+    try:
+        await notify_partenaire(
+            session,
+            partenaire_id = id_partenaire,
+            type_         = NotifType.PAIEMENT_RECU,
+            titre         = "💰 Paiement reçu",
+            message       = (
+                f"Vous avez reçu un paiement de {montant_final:.2f} DT "
+                f"d'EasyVoyage (Facture {numero_facture})."
+                + (f" Note : {note}" if note else "")
+            ),
+        )
+    except Exception:
+        pass  # ne jamais bloquer le paiement
+
     await session.commit()
 
     return PayerPartenaireResponse(
@@ -1037,6 +1064,11 @@ async def get_demandes_retrait(
     return DemandesRetraitResponse(total=total, page=page, per_page=per_page, items=items)
 
 
+# ═══════════════════════════════════════════════════════════
+#  VALIDER UNE DEMANDE DE RETRAIT
+#  ✅ ✨ NEW : Notifie le partenaire dans la cloche
+# ═══════════════════════════════════════════════════════════
+
 async def valider_demande_retrait(
     demande_id: int,
     note_admin: Optional[str],
@@ -1078,6 +1110,22 @@ async def valider_demande_retrait(
         numero_facture = numero_facture,
         pdf_data       = pdf_bytes,
     ))
+
+    # ── ✨ NEW : Notifier le partenaire dans la cloche ─────
+    try:
+        await notify_partenaire(
+            session,
+            partenaire_id = demande.id_partenaire,
+            type_         = NotifType.RETRAIT_APPROUVE,
+            titre         = "✅ Demande de retrait approuvée",
+            message       = (
+                f"Votre demande de retrait de {float(demande.montant):.2f} DT "
+                f"a été approuvée. Facture {numero_facture} générée et envoyée par email."
+            ),
+        )
+    except Exception:
+        pass  # ne jamais bloquer la validation
+
     await session.commit()
 
     return DemandeActionResponse(
@@ -1085,6 +1133,11 @@ async def valider_demande_retrait(
         message = f"Demande #{demande_id} approuvée — Facture {numero_facture} générée et envoyée.",
     )
 
+
+# ═══════════════════════════════════════════════════════════
+#  REFUSER UNE DEMANDE DE RETRAIT
+#  ✅ ✨ NEW : Notifie le partenaire dans la cloche
+# ═══════════════════════════════════════════════════════════
 
 async def refuser_demande_retrait(
     demande_id: int,
@@ -1106,6 +1159,23 @@ async def refuser_demande_retrait(
     demande.statut     = "REFUSEE"
     demande.note_admin = note_admin
     demande.updated_at = datetime.now()
+
+    # ── ✨ NEW : Notifier le partenaire dans la cloche ─────
+    try:
+        raison = note_admin or "Aucune raison spécifiée"
+        await notify_partenaire(
+            session,
+            partenaire_id = demande.id_partenaire,
+            type_         = NotifType.RETRAIT_REFUSE,
+            titre         = "❌ Demande de retrait refusée",
+            message       = (
+                f"Votre demande de retrait de {float(demande.montant):.2f} DT "
+                f"a été refusée. Motif : {raison}"
+            ),
+        )
+    except Exception:
+        pass  # ne jamais bloquer le refus
+
     await session.commit()
 
     return DemandeActionResponse(
