@@ -400,9 +400,21 @@ async def payer_reservation(
             if chambre_obj and chambre_obj.hotel:
                 etoiles = chambre_obj.hotel.etoiles
 
+        # ✅ FIX : calcul du nombre de personnes (adultes + enfants)
+        # Requis par calculer_fiscal() pour la taxe de séjour :
+        # taxe = valeur_par_nuit × nb_nuits_taxables × nb_personnes
+        nb_personnes = (resa.nb_adultes or 0) + (resa.nb_enfants or 0)
+        if nb_personnes < 1:
+            # Fallback : déduire depuis les lignes de chambres
+            nb_personnes = sum(
+                (l.nb_adultes or 0) + (l.nb_enfants or 0)
+                for l in resa.lignes_chambres
+            ) or 1
+
         fiscal = await calculer_fiscal(
             montant_ht    = float(resa.total_ttc),
             nb_nuits      = nb_nuits,
+            nb_personnes  = nb_personnes,        # ← LIGNE AJOUTÉE (FIX)
             etoiles_hotel = etoiles,
             session       = session,
         )

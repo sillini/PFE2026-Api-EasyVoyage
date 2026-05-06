@@ -284,3 +284,96 @@ async def google_auth(
             logger.warning(f"[NOTIF] Échec création notif Google OAuth : {exc}")
 
     return auth_service._build_token_response(user)
+
+
+"""
+=================================================================
+BLOC À AJOUTER À `app/api/v1/endpoints/auth.py`
+=================================================================
+Ces 3 endpoints PUBLIC (sans auth) implémentent le flux complet
+de réinitialisation de mot de passe.
+
+⚠️ Ne pas oublier d'ajouter les imports en haut du fichier auth.py :
+
+    from app.schemas.auth_forgot_password import (
+        ForgotPasswordRequest,
+        ForgotPasswordVerifyRequest,
+        ForgotPasswordResetRequest,
+        ForgotPasswordResponse,
+        ForgotPasswordVerifyResponse,
+        ForgotPasswordResetResponse,
+    )
+    import app.services.forgot_password_service as fp_service
+
+=================================================================
+"""
+
+# ──────────────────────────────────────────────────────────
+#  MOT DE PASSE OUBLIÉ — 3 étapes (PUBLIC)
+# ──────────────────────────────────────────────────────────
+from app.schemas.auth_forgot_password import (
+        ForgotPasswordRequest,
+        ForgotPasswordVerifyRequest,
+        ForgotPasswordResetRequest,
+        ForgotPasswordResponse,
+        ForgotPasswordVerifyResponse,
+        ForgotPasswordResetResponse,
+    )
+import app.services.forgot_password_service as fp_service
+
+@router.post(
+    "/forgot-password/request",
+    response_model=ForgotPasswordResponse,
+    summary="Mot de passe oublié — Étape 1 : demander un code",
+    description=(
+        "Reçoit un email et envoie un code de vérification à 6 chiffres "
+        "si un compte est associé à cet email. "
+        "Pour des raisons de sécurité, la réponse est identique que l'email "
+        "existe ou non (anti-énumération)."
+    ),
+)
+async def forgot_password_request(
+    data: ForgotPasswordRequest,
+    session: AsyncSession = Depends(get_db),
+) -> ForgotPasswordResponse:
+    return await fp_service.request_forgot_password(data.email, session)
+
+
+@router.post(
+    "/forgot-password/verify",
+    response_model=ForgotPasswordVerifyResponse,
+    summary="Mot de passe oublié — Étape 2 : vérifier le code",
+    description=(
+        "Vérifie qu'un code OTP est valide. "
+        "Le code n'est pas consommé à cette étape : il sera consommé "
+        "lors de la finalisation du reset (étape 3)."
+    ),
+)
+async def forgot_password_verify(
+    data: ForgotPasswordVerifyRequest,
+    session: AsyncSession = Depends(get_db),
+) -> ForgotPasswordVerifyResponse:
+    return await fp_service.verify_forgot_password_code(
+        data.email, data.code, session
+    )
+
+
+@router.post(
+    "/forgot-password/reset",
+    response_model=ForgotPasswordResetResponse,
+    summary="Mot de passe oublié — Étape 3 : définir un nouveau mot de passe",
+    description=(
+        "Définit un nouveau mot de passe après vérification finale du code OTP. "
+        "Le code est marqué comme utilisé après cette opération."
+    ),
+)
+async def forgot_password_reset(
+    data: ForgotPasswordResetRequest,
+    session: AsyncSession = Depends(get_db),
+) -> ForgotPasswordResetResponse:
+    return await fp_service.reset_forgot_password(
+        email=data.email,
+        code=data.code,
+        new_password=data.new_password,
+        session=session,
+    )

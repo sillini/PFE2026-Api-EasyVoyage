@@ -457,7 +457,7 @@ async def list_reservations_enrichi(
     source:    Optional[str] = Query(None),
     search:    Optional[str] = Query(None),
     page:      int           = Query(1, ge=1),
-    per_page:  int           = Query(20, ge=1, le=100),
+    per_page:  int           = Query(20, ge=1, le=2000),
     session: AsyncSession    = Depends(get_db),
     _: TokenData             = Depends(require_admin),
 ):
